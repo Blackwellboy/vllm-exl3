@@ -1,0 +1,23 @@
+{
+  "scope": "Historical lab implementation; not full-model qualification of current upstream",
+  "model": "vcruz305/DSV4.1-Flash-SAGE-EXL3-3.30bpw",
+  "model_revision": "e831e9e4d6bfeafa6d630848296417b1393404a3",
+  "sources": {
+    "expert_store.py": {
+      "sha256": "05a8d337f3eda5a4d451216ba69294c14f0d58211c91c0ec802f5646f45d156b",
+      "extracted_without_code_changes": true
+    },
+    "expert_cache.py": {
+      "sha256": "7f03bf121ed6c6c0f30ac0633be600f691beb75153f9b6c034ca207acc08ae2b",
+      "extracted_without_code_changes": true
+    },
+    "async_store.py": {
+      "sha256": "be242ba5ae23c2f35978a5d464856c4afa8a85efb3247e0bc5040b3731491275",
+      "extracted_without_code_changes": true
+    },
+    "engram_rows.py": {
+      "sha256": "3ff7efd8b2e720fd606011a4bb0c610eac661610ac9e57d18e49cb285cc8647e",
+      "extracted_without_code_changes": true
+    }
+  }
+}

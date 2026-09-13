@@ -1,0 +1,20 @@
+name: Experimental NVMe component checks
+on:
+  pull_request:
+    paths:
+      - 'experiments/dsv41_nvme/**'
+      - '.github/workflows/nvme-components.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'experiments/dsv41_nvme/**'
+      - '.github/workflows/nvme-components.yml'
+jobs:
+  portable-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s experiments/dsv41_nvme -p 'test_*.py' -v
