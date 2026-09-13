@@ -44,3 +44,24 @@ before vLLM can load it.
 
 Typical order: scan, rewrite the config, regenerate the index, then run the
 gates in `tools/verify_native_pack/` before booting a server.
+
+## Repair a shard with gaps between tensors
+
+`compact_safetensors.py` copies an existing shard into a new, contiguous
+container when a safetensors reader rejects gaps in its payload layout.
+Names, shapes, dtypes, metadata and tensor bytes are preserved, including
+per-projection packed K and signed MUL1 markers. It does not requantize.
+
+```sh
+python3 tools/exl3_pack_tools/compact_safetensors.py source.safetensors repaired.safetensors > receipts.json
+python3 -m pytest -q tests/test_compact_safetensors.py
+```
+
+The destination must not exist. The tool rejects overlaps, truncation,
+duplicate JSON keys and inconsistent shapes, and streams with a 1 MiB copy
+buffer plus the header and per-tensor receipts. Unreferenced padding is
+discarded; unsupported dtypes fail rather than being guessed. The source
+must remain idle during the copy. Receipts contain SHA256 hashes of copied
+tensor bytes, not proof of a trusted model revision. Keep the original
+checkpoint and revision checks. If shard filenames change in the serving
+copy, regenerate its index before loading it.
