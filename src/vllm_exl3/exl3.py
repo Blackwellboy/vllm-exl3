@@ -1951,6 +1951,17 @@ class Exl3Config(QuantizationConfig):
             return self.bits
         return self.layer_bits.get(int(m.group(1)), self.bits)
 
+    @property
+    def weight_block_size(self):
+        # Expose the fp8 delegate's block shape at the outer config so
+        # architecture-level probes (e.g. the V4.1 linear scale-name mapper)
+        # see [32, 32] for packs that delegate non-routed weights via
+        # ``non_routed_quantization``. Must be a list to compare equal with
+        # the source config's [32, 32].
+        nrq = getattr(self, "non_routed_quantization", None) or {}
+        wbs = nrq.get("weight_block_size")
+        return list(wbs) if wbs else None
+
     def _matches_non_routed_exl3(self, prefix: str) -> bool:
         """Check if prefix matches non_routed_exl3: either layers dict keys or modules list."""
         if not self.non_routed_exl3:
@@ -2448,6 +2459,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         owner_mod = owner if owner is not None else getattr(param, "_exl3_owner", None)
         tp_rank, tp_size = _resolve_tp_geometry(owner_mod, param)
+        if getattr(owner_mod, "use_ep", False):
+            # Expert parallel: experts are whole; feature slicing must not run
+            # (shard_exl3_col/row would quarter already-whole expert tensors).
+            tp_rank, tp_size = 0, 1
         suffix = _suffix_from_mapped_name(weight_name)
         # Avoid an early full-tensor .contiguous() copy. On GB10 UMA that
         # transient host copy sits beside the eventual device payload and was
