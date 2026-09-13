@@ -797,16 +797,22 @@ def _madv_dontneed_cpu_tensor(src: "torch.Tensor") -> bool:
         if ptr == 0 or nbytes <= 0:
             return False
         page = os.sysconf("SC_PAGESIZE")
-        start = ptr - (ptr % page)
-        end = ptr + nbytes
-        end = end + (page - end % page) % page
+        # Only DONTNEED fully-covered interior pages. Rounding outward into
+        # partial edge pages can discard adjacent heap allocations and SEGV
+        # CPU unit tests (heap tensors); MAP_PRIVATE safetensors loads are
+        # large/page-aligned so interior coverage still reclaims COW.
+        start = ptr + ((page - (ptr % page)) % page)
+        end = (ptr + nbytes) - ((ptr + nbytes) % page)
+        if end <= start:
+            return False
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
         libc.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
         libc.madvise.restype = ctypes.c_int
-        rc = libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(end - start), 4)
+        advised = end - start
+        rc = libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(advised), 4)
         if rc == 0:
             _DIRECT_FILL_STATS["MADV_AFTER_H2D_CALLS"] += 1
-            _DIRECT_FILL_STATS["MADV_AFTER_H2D_BYTES"] += nbytes
+            _DIRECT_FILL_STATS["MADV_AFTER_H2D_BYTES"] += advised
             return True
     except Exception:
         return False
