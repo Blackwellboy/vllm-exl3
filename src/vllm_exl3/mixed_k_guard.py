@@ -88,7 +88,13 @@ def install_mixed_k_prescan_guard(exl3_module: Any) -> None:
         resolver = getattr(exl3_module, "_resolve_tp_geometry", None)
         tp_size = 1
         if callable(resolver):
-            _rank, tp_size = resolver(layer)
+            try:
+                _rank, tp_size = resolver(layer)
+            except ModuleNotFoundError:
+                # CPU-only unit tests intentionally run without vLLM. If the
+                # synthetic layer carries no TP metadata, TP1 is the only safe
+                # interpretation and matches the legacy prescan contract.
+                tp_size = 1
         return shard_prescanned_trellis_shapes(shapes, int(tp_size))
 
     guarded._vllm_exl3_mixed_k_prescan_guard = True
