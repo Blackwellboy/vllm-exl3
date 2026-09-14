@@ -2968,11 +2968,11 @@ def _check_ngram_disk_graph_mode() -> None:
             f"{NGRAM_TABLE_ENV}=disk needs PIECEWISE CUDA graphs with the lookup kept "
             "eager; got cudagraph_mode=%s. Pass --compilation-config with "
             '{"cudagraph_mode": "PIECEWISE", "splitting_ops": [<the attention ops>, '
-            '"vllm.exl3_ngram_lookup"]}' % name
+            '"vllm::exl3_ngram_lookup"]}' % name
         )
-    if ops and "vllm.exl3_ngram_lookup" not in ops:
+    if ops and "vllm::exl3_ngram_lookup" not in ops:
         raise RuntimeError(
-            f"{NGRAM_TABLE_ENV}=disk: add \"vllm.exl3_ngram_lookup\" to splitting_ops so "
+            f"{NGRAM_TABLE_ENV}=disk: add \"vllm::exl3_ngram_lookup\" to splitting_ops so "
             "the host gather runs outside the piecewise graphs"
         )
 
@@ -3245,7 +3245,7 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         checkpoint, one upload, decode on the device, expand back.
 
         The device-to-host copy is a synchronization point, so this op must run
-        eagerly: PIECEWISE CUDA graphs with ``vllm.exl3_ngram_lookup`` in
+        eagerly: PIECEWISE CUDA graphs with ``vllm::exl3_ngram_lookup`` in
         ``splitting_ops``. Under a FULL graph the copy cannot be captured.
         """
         ids = input_.reshape(-1).to(torch.int64)
