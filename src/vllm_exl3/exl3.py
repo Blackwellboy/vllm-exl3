@@ -3256,12 +3256,11 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
             layer._exl3_ngram_head_offsets_cpu, uids_cpu, right=True
         ) - 1
         heads_cpu = heads_cpu.clamp_(0, self.num_heads - 1).to(torch.int32)
-        dev = input_.device
-        if dev.type == "cuda":
-            packed = packed_cpu.pin_memory().to(dev, non_blocking=True)
-            heads = heads_cpu.pin_memory().to(dev, non_blocking=True)
-        else:
-            packed, heads = packed_cpu, heads_cpu
+        # Blocking uploads on purpose: a non_blocking copy out of a pinned temporary
+        # can outlive the temporary and read freed memory, and the device-to-host copy
+        # above already synchronized this stream, so nothing is gained by overlapping.
+        packed = packed_cpu.to(input_.device)
+        heads = heads_cpu.to(input_.device)
         rows = self._decode(layer, packed, heads)
         out = rows.index_select(0, inverse.to(rows.device))
         return out.to(layer._exl3_ngram_dtype).view(*input_.shape, NGRAM_ROW_DIM)
