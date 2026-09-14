@@ -2518,6 +2518,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         owner_mod = owner if owner is not None else getattr(param, "_exl3_owner", None)
         tp_rank, tp_size = _resolve_tp_geometry(owner_mod, param)
+        if getattr(owner_mod, "use_ep", False):
+            # Expert parallel: experts are whole; feature slicing must not run
+            # (shard_exl3_col/row would quarter already-whole expert tensors).
+            tp_rank, tp_size = 0, 1
         suffix = _suffix_from_mapped_name(weight_name)
         # Avoid an early full-tensor .contiguous() copy. On GB10 UMA that
         # transient host copy sits beside the eventual device payload and was
