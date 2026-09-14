@@ -3223,15 +3223,29 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
             return out
         return ngram_dequant_rows_torch(packed, self.bits, heads, bias)
 
+    def _ngram_lookup_uses_out_variant(self, layer: torch.nn.Module) -> bool:
+        """Whether this lookup has to write into a caller-allocated buffer.
+
+        Only the opt-in disk table needs it. There the lookup runs eagerly as a
+        CUDA-graph splitting op, so the output buffer must be allocated in the
+        piece before the split. The resident table keeps the mainline returning
+        op, so nothing about the default path changes.
+        """
+        return getattr(layer, "_exl3_ngram_disk", None) is not None
+
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         name = getattr(layer, "_exl3_opaque_name", None)
         if name is not None and _EXL3_OPS_READY:
-            # Out-variant on purpose. When this op is a splitting op (disk mode), the
-            # piecewise CUDA graph after it was captured reading its input at one
-            # address; a fresh tensor returned from an eager op lands anywhere. The
-            # buffer is allocated here, inside the piece before the split, so its
-            # address is the graph's own and stable across replays, the same way
-            # vLLM's attention and PLE ops take their output as an argument.
+            if not self._ngram_lookup_uses_out_variant(layer):
+                return torch.ops.vllm.exl3_ngram_lookup(input_, name)
+            # Out-variant on purpose, and reachable only with
+            # ``VLLM_EXL3_NGRAM_TABLE=disk``. When this op is a splitting op (disk
+            # mode), the piecewise CUDA graph after it was captured reading its
+            # input at one address; a fresh tensor returned from an eager op lands
+            # anywhere. The buffer is allocated here, inside the piece before the
+            # split, so its address is the graph's own and stable across replays,
+            # the same way vLLM's attention and PLE ops take their output as an
+            # argument.
             out = torch.empty(
                 *input_.shape, NGRAM_ROW_DIM, dtype=layer._exl3_ngram_dtype, device=input_.device
             )

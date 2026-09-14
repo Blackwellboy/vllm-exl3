@@ -151,6 +151,20 @@ def test_disk_table_routes_rows_across_shards():
     assert d.num_rows == ROWS
 
 
+def test_only_the_disk_table_asks_for_the_caller_allocated_output(monkeypatch):
+    """The opt-in disk mode needs the out-variant lookup; the default resident table
+    keeps the returning lookup op, so the mainline serving path is untouched."""
+    table = _table(3)
+    resident = _method({}, "resident", monkeypatch)
+    assert resident._ngram_lookup_uses_out_variant(_build(resident, table, sharded=True)) is False
+    resident_uns = _method({"num_shards": 1, "rows_per_shard": ROWS, "sharded": False}, "resident", monkeypatch)
+    assert resident_uns._ngram_lookup_uses_out_variant(
+        _build(resident_uns, table, sharded=False)
+    ) is False
+    disk = _method({}, "disk", monkeypatch)
+    assert disk._ngram_lookup_uses_out_variant(_build(disk, table, sharded=True)) is True
+
+
 def test_unsharded_spec_requires_one_shard(monkeypatch):
     with pytest.raises(ValueError):
         _method({"sharded": False}, "resident", monkeypatch)

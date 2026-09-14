@@ -6,6 +6,7 @@
 
 - Unsharded n-gram tables. Packs from exllamav3 1.5.0 onward ship the table as one `<root>.trellis` tensor instead of `shard_<i>.trellis` pieces; the scan tool now recognises that layout (a `trellis` whose root also carries `head_offsets`), the config tool emits `ngram_embedding.sharded: false` with `num_shards: 1`, and the loader registers the matching `trellis` parameter. No pack rewrite is needed any more for turboderp's `4.05bpw_h6_ng6` revision.
 - `VLLM_EXL3_NGRAM_TABLE=disk`. The packed n-gram table stays in the checkpoint: the loader keeps vLLM's memory-mapped safetensors views instead of copying into a resident int16 tensor, and each lookup gathers its unique rows on the host, uploads them, and decodes on the device. The table then costs page cache rather than 32 to 36 GiB of device memory. The host gather is a synchronization point, so this mode needs `--compilation-config '{"cudagraph_mode": "PIECEWISE", "splitting_ops": [...attention ops..., "vllm::exl3_ngram_lookup_out"]}'`; the loader refuses FULL graph modes with that message. Default stays `resident`. Tests: `tests/test_ngram_layouts.py`.
+- The caller-allocated lookup op (`vllm::exl3_ngram_lookup_out`) is reachable only with `VLLM_EXL3_NGRAM_TABLE=disk`; `resident` serving keeps the existing returning lookup op.
 
 ## 0.4.2 (2026-09-09)
 
