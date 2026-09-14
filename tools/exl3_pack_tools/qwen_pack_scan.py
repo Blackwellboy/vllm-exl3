@@ -54,16 +54,28 @@ def main():
     # n-gram tables first: roots are discovered from shard trellis names, then every
     # tensor directly under a root that is not a shard is an aux tensor of that table.
     ngram = {}
+    names = {name for _, name, _, _ in tensors}
     for _, name, dtype, shape in tensors:
         m = ngram_re.match(name)
         if m and len(shape) == 2:
-            t = ngram.setdefault(m.group(1), {"shards": set(), "shapes": set(), "dtypes": set(), "aux": {}})
+            t = ngram.setdefault(m.group(1), {"shards": set(), "shapes": set(), "dtypes": set(), "aux": {}, "sharded": True})
             t["shards"].add(int(m.group(2)))
+            t["shapes"].add((int(shape[0]), int(shape[1])))
+            t["dtypes"].add(dtype)
+            continue
+        # Unsharded layout (exllamav3 1.5.0-era packs): one `<root>.trellis` holding the
+        # whole table, told apart from a dense linear's trellis by the table's aux
+        # tensors living under the same root.
+        if name.endswith(".trellis") and len(shape) == 2 and name[:-len(".trellis")] + ".head_offsets" in names:
+            root = name[:-len(".trellis")]
+            t = ngram.setdefault(root, {"shards": set(), "shapes": set(), "dtypes": set(), "aux": {}, "sharded": False})
+            t["sharded"] = False
+            t["shards"].add(0)
             t["shapes"].add((int(shape[0]), int(shape[1])))
             t["dtypes"].add(dtype)
     for _, name, dtype, shape in tensors:
         for root, t in ngram.items():
-            if name.startswith(root + ".") and ".shard_" not in name[len(root):]:
+            if name.startswith(root + ".") and ".shard_" not in name[len(root):] and name != root + ".trellis":
                 t["aux"][name[len(root) + 1:]] = {"dtype": dtype, "shape": [int(s) for s in shape]}
     ngram_tables = {}
     ngram_problems = []
@@ -84,6 +96,7 @@ def main():
             "words": words,
             "bits": (words - 1) * 16 // NGRAM_ROW_DIM,
             "total_rows": len(shards) * rows,
+            "sharded": bool(t["sharded"]),
             "aux": t["aux"],
         }
     ngram_roots = tuple(ngram)
