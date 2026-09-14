@@ -122,15 +122,23 @@ jobs:
       - name: Install Test Dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest
+          python -m pip install pytest safetensors numpy
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run Pytest Suite
         run: python -m pytest -v
 
   exllamav3-aarch64-patch-test:
-    name: Pinned Spark ExLlamaV3 aarch64 Patch Verification
+    name: ExLlamaV3 aarch64 Patch Verification (${{ matrix.label }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Spark pin
+            ref: be57335b087e4f001c5caae061544df3c06ba01e   # keep equal to EXLLAMAV3_SPARK_REF; env is not available in a matrix
+          - label: v1.5.0
+            ref: 0740edc2da569fb99174023c1d2988b1e98cb41e
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -140,13 +148,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Fetch exact Spark-pinned ExLlamaV3
+      - name: Fetch the pinned ExLlamaV3 revision
         run: |
           git init /tmp/exllamav3_test
           git -C /tmp/exllamav3_test remote add origin https://github.com/turboderp-org/exllamav3.git
-          git -C /tmp/exllamav3_test fetch --depth 1 origin "$EXLLAMAV3_SPARK_REF"
+          git -C /tmp/exllamav3_test fetch --depth 1 origin "${{ matrix.ref }}"
           git -C /tmp/exllamav3_test checkout --detach FETCH_HEAD
-          test "$(git -C /tmp/exllamav3_test rev-parse HEAD)" = "$EXLLAMAV3_SPARK_REF"
+          test "$(git -C /tmp/exllamav3_test rev-parse HEAD)" = "${{ matrix.ref }}"
 
       - name: Execute aarch64 adapter
         run: |
