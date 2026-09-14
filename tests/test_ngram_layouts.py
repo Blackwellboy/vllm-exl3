@@ -88,11 +88,12 @@ def test_scan_reports_unsharded_layout_and_keeps_it_out_of_dense_map(tmp_path):
     assert list(scan["ngram_tables"]) == [ROOT]
 
 
-def _method(spec_extra: dict, table_mode: str, monkeypatch):
+def _method(spec_extra: dict, table_mode: str, monkeypatch, patch_guard: bool = True):
     monkeypatch.setenv(X.NGRAM_TABLE_ENV, table_mode)
     monkeypatch.setenv("VLLM_EXL3_NGRAM_KERNEL", "torch")
     monkeypatch.setattr(X, "_resolve_tp_geometry", lambda layer: (0, 1))
-    monkeypatch.setattr(X, "_check_ngram_disk_graph_mode", lambda: None)
+    if patch_guard:
+        monkeypatch.setattr(X, "_check_ngram_disk_graph_mode", lambda: None)
     cfg = X.Exl3Config(bits=3, codebook="mul1")
     spec = {"bits": BITS, "num_shards": 2, "rows_per_shard": ROWS // 2, "num_heads": HEADS}
     spec.update(spec_extra)
@@ -113,6 +114,9 @@ def _build(method, table: torch.Tensor, sharded: bool):
         p = getattr(layer, name)
         p.weight_loader(p, aux[f"{ROOT}.{name}"])
     method.process_weights_after_loading(layer)
+    # vLLM's layer constructors assign the method to the layer; the registered ops and
+    # ``embedding()`` both reach the table through ``layer.quant_method``.
+    layer.quant_method = method
     return layer
 
 
@@ -175,3 +179,100 @@ def test_table_env_is_validated(monkeypatch):
     with pytest.raises(ValueError):
         X.Exl3EmbeddingMethod(X.Exl3Config(bits=3, codebook="mul1"),
                               {"bits": BITS, "num_shards": 1, "rows_per_shard": ROWS, "num_heads": HEADS})
+
+
+# ---------------------------------------------------------------------------
+# In-image tests: the real vLLM op namespace and vLLM's own config object. Short
+# on purpose: no model, no weights, no GPU.
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+
+def _mode(name: str):
+    """vLLM's graph mode if this image has it (an enum read through ``.name``), else a stub."""
+    try:
+        from vllm.config.compilation import CUDAGraphMode
+
+        return getattr(CUDAGraphMode, name)
+    except Exception:
+        return types.SimpleNamespace(name=name)
+
+
+def _graph_config(mode, splitting_ops):
+    cfg = types.SimpleNamespace(
+        cudagraph_mode=mode, splitting_ops=list(splitting_ops)
+    )
+    return types.SimpleNamespace(compilation_config=cfg)
+
+
+def _set_vllm_config(monkeypatch, cfg):
+    vllm_config = pytest.importorskip("vllm.config")
+    monkeypatch.setattr(vllm_config, "get_current_vllm_config", lambda: cfg)
+
+
+def test_the_registered_ops_are_the_ones_the_disk_guard_names(monkeypatch):
+    """Registration is best effort, so assert it happened; the disk guard names a string
+    vLLM has to resolve in the same namespace, so assert that name really is registered."""
+    assert X._EXL3_OPS_READY is True
+    assert torch.ops.vllm.exl3_ngram_lookup is not None
+    assert torch.ops.vllm.exl3_ngram_lookup_out is not None
+
+    _set_vllm_config(monkeypatch, _graph_config(_mode("PIECEWISE"), ["vllm::attention"]))
+    with pytest.raises(RuntimeError, match="vllm::exl3_ngram_lookup_out"):
+        X._check_ngram_disk_graph_mode()
+
+
+def test_disk_mode_fails_closed_under_full_graphs_and_passes_when_split(monkeypatch):
+    _set_vllm_config(monkeypatch, _graph_config(_mode("FULL"), []))
+    with pytest.raises(RuntimeError, match="PIECEWISE"):
+        X._check_ngram_disk_graph_mode()
+
+    _set_vllm_config(
+        monkeypatch,
+        _graph_config(_mode("PIECEWISE"), ["vllm::attention", "vllm::exl3_ngram_lookup_out"]),
+    )
+    X._check_ngram_disk_graph_mode()  # the documented configuration is accepted
+
+
+def test_disk_build_refuses_full_graphs_end_to_end(monkeypatch):
+    """The guard runs inside the load path, not only when called directly."""
+    _set_vllm_config(monkeypatch, _graph_config(_mode("FULL"), []))
+    with pytest.raises(RuntimeError, match="PIECEWISE"):
+        _build(_method({}, "disk", monkeypatch, patch_guard=False), _table(8), sharded=True)
+
+    _set_vllm_config(
+        monkeypatch,
+        _graph_config(_mode("PIECEWISE"), ["vllm::attention", "vllm::exl3_ngram_lookup_out"]),
+    )
+    _build(_method({}, "disk", monkeypatch, patch_guard=False), _table(8), sharded=True)
+
+
+def test_resident_build_is_untouched_by_full_graphs(monkeypatch):
+    """The default (and only C3-serving) table must not need the disk-mode opt-in."""
+    _set_vllm_config(monkeypatch, _graph_config(_mode("FULL"), []))
+    resident = _method({}, "resident", monkeypatch, patch_guard=False)
+    layer = _build(resident, _table(9), sharded=True)
+    assert resident._ngram_lookup_uses_out_variant(layer) is False
+
+
+def test_embedding_dispatch_through_the_registered_ops_matches_every_layout(monkeypatch):
+    """Goes through ``embedding()``, i.e. the ops vLLM executes, not ``_embedding_impl``."""
+    table = _table(7)
+    ids = torch.tensor([[0, 5, 31, 32, 63, 5]], dtype=torch.long)
+
+    resident = _method({}, "resident", monkeypatch)
+    ref_layer = _build(resident, table, sharded=True)
+    expected = resident.embedding(ref_layer, ids)
+    assert torch.equal(expected, _lookup(resident, ref_layer, ids))
+    assert torch.equal(torch.ops.vllm.exl3_ngram_lookup(ids, ref_layer._exl3_opaque_name), expected)
+
+    uns = _method({"num_shards": 1, "rows_per_shard": ROWS, "sharded": False}, "resident", monkeypatch)
+    assert torch.equal(uns.embedding(_build(uns, table, sharded=False), ids), expected)
+
+    disk = _method({}, "disk", monkeypatch)
+    disk_layer = _build(disk, table, sharded=True)
+    assert torch.equal(disk.embedding(disk_layer, ids), expected)
+    out = torch.empty_like(expected)
+    assert torch.ops.vllm.exl3_ngram_lookup_out(ids, disk_layer._exl3_opaque_name, out) is None
+    assert torch.equal(out, expected)  # the out-variant wrote in place into the caller's buffer
