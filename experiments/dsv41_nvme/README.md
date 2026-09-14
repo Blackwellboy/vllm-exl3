@@ -44,9 +44,31 @@ python3 -m unittest discover -s experiments/dsv41_nvme -p 'test_*.py' -v
 The tests create synthetic fixtures in temporary directories. No model
 download, Torch, CUDA, server, credentials or private host configuration is
 needed. They cover corruption, short reads, retry, cancellation, retained
-views, concurrent read bounds, eviction accounting, duplicate rows, ownership,
-changed files and shutdown. Buffered I/O is explicitly selected for these
-tests; they do not prove Linux direct I/O or GPU numerical correctness.
+views, concurrent read bounds, staging-lease ownership, eviction accounting,
+duplicate rows, ownership, changed files and shutdown. Buffered I/O is
+explicitly selected for these tests; they do not prove Linux direct I/O or GPU
+numerical correctness.
+
+### Source identity is stat-only
+
+`EngramRows` detects a changed table from a single `fstat` tuple —
+`(st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns)` — and never hashes the
+payload it is about to serve. Two consequences are part of the contract:
+
+- A same-size in-place rewrite that lands inside one inode-timestamp tick
+  cannot be distinguished from an unchanged file, because Linux stamps inode
+  times from a coarse (timer-tick) clock. The guard is genuinely ineffective in
+  that window; detecting it needs content hashing, which this module
+  deliberately does not perform at this layer.
+- A byte-identical replacement that keeps size and identity, or a mutation
+  after the caller has already been handed cached rows, is outside what the
+  tuple can express. The caller owns content trust: it must hash or verify the
+  source before/at first use, and must not mutate a file it has handed to
+  `EngramRows`.
+
+The changed-source checks therefore pin the timestamp explicitly (via
+`os.utime`) instead of sleeping for a later tick, and cover the size-change path
+separately, so neither check depends on writer scheduling.
 
 These components require POSIX `os.pread`/`os.preadv`, in buffered mode too:
 neither transport falls back to another syscall on a platform that lacks them.
@@ -123,6 +145,36 @@ and the memory budget. The reference GPU cache synchronizes before releasing
 staging storage or recycling slots; CUDA-context failure requires worker
 termination. Its host RAM/swap check is a guard for Spark unified memory, not
 a replacement for cgroup limits and an external watchdog.
+
+### Lease stream ownership and lifetime (reviewed, not GPU-qualified)
+
+`ExpertCache.lease()` documents no stream contract, so the invariant it assumes
+is recorded here instead. The completion event that gates eviction is recorded
+on `torch.cuda.current_stream(device)` **at release time**, while `_evict()`
+synchronizes exactly those events before clearing the `LinearEXL3` handles and
+returning the arena range to `Regions`.
+
+- Caller obligation: acquire, use and release one lease on **one** stream. If a
+  lease is acquired and used inside `torch.cuda.stream(s)` but released after
+  that context exits, the event is recorded on the outer stream, which has no
+  happens-before edge to the work on `s`; eviction could then synchronize an
+  already-complete event and recycle storage still being read on `s`.
+- Lifetime: a caller must not retain `entry` or its projections after the
+  `with` block. The arena range is only protected while `users > 0`, and the
+  projections are cleared on eviction.
+- Verified by inspection: the release path records the event and then decrements
+  `users`, both under the cache lock, so an entry cannot reach `users == 0`
+  without a covering event; `_evict` refuses with `CacheBusy` while `users > 0`;
+  `clear()`/`close()` refuse while any lease is active; entry eviction is
+  restricted to the same layer, so one layer cannot free another's arena.
+- Event accounting is bounded: a completed event is dropped only on the hit
+  path, and a freshly loaded entry starts with none, so growth tracks in-flight
+  leases rather than total leases.
+- Not qualified here: whether recording on the acquisition stream (or asserting
+  release-on-use-stream) is the better fix needs a GPU, and all four
+  implementations are byte-pinned by `source-provenance.json`, so no source
+  edit is made. `expert_cache.py` remains NOT RUN on this host; no CUDA receipt
+  is claimed for it.
 
 Full-model throughput remains slow. Isolated cache hits or overlapping reads
 are not evidence of a serving speedup. CUDA graphs, DSpark and larger-context

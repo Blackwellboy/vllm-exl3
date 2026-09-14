@@ -68,9 +68,39 @@ class EngramRowTests(unittest.TestCase):
         self.gather([5,6])
         self.assertEqual(self.cache.stats['prefetch_unused'],1)
 
+    def _mutate_one_payload_byte(self):
+        """Same-size in-place payload mutation with a deterministic time stamp.
+
+        `EngramRows` holds the identity tuple (st_dev, st_ino, st_size,
+        st_mtime_ns, st_ctime_ns) taken with fstat at construction. Linux stamps
+        inode times from a coarse (timer-tick) clock, so a write that lands in the
+        same tick as file creation leaves the whole tuple unchanged and the guard
+        cannot see it; relying on a later tick is a race, not a check. Pinning
+        st_mtime_ns explicitly to a value one second away makes the tuple change
+        on any filesystem, including second-granularity ones, without sleeping.
+        """
+        recorded=EngramRows._identity(self.cache.w_fd)
+        with self.w.open('r+b') as source:
+            source.seek(6+3*256);source.write(b'x');source.flush();os.fsync(source.fileno())
+        os.utime(self.w,ns=(recorded[3]-10**9,recorded[3]-10**9))
+        observed=EngramRows._identity(self.cache.w_fd)
+        # If this ever fires the write stopped being size-preserving and the test
+        # would be proving the wrong thing.
+        self.assertEqual(observed[2],recorded[2])
+        if observed[3]==recorded[3]:
+            self.skipTest('filesystem does not persist an explicit nanosecond mtime')
+
     def test_changed_source_is_rejected_even_for_cache_hit(self):
         self.gather([3])
-        with self.w.open('r+b') as source:source.seek(6+3*256);source.write(b'x')
+        self._mutate_one_payload_byte()
+        with self.assertRaises(ValueError):self.gather([3])
+
+    def test_source_size_change_is_rejected_even_for_cache_hit(self):
+        # Stat-only identity catches a size change with no timestamp dependency
+        # at all, so this path stays deterministic even where st_mtime_ns is
+        # quantized to seconds and the same-tick case above is undetectable.
+        self.gather([3])
+        with self.w.open('ab') as source:source.write(b'z')
         with self.assertRaises(ValueError):self.gather([3])
 
     def test_short_read_and_invalid_request_are_rejected(self):

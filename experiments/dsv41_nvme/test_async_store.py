@@ -90,6 +90,28 @@ class AsyncStoreTests(unittest.TestCase):
         self.assertEqual(store.staging_bytes,0)
 
     @requires_posix_reads
+    def test_leased_staging_record_stays_owned_until_its_view_is_released(self):
+        # Ownership contract for a staging lease: while a consumer still exports
+        # a view, the record keeps its slot and its accounted bytes, the store
+        # refuses to close, and the same ticket is re-yielded (not re-read) once
+        # the view is gone. No allocation is lost and nothing is double-counted.
+        store=self.store()
+        with self.assertRaises(BufferError):
+            with store.read('0:1') as data:view=memoryview(data)
+        self.assertIsInstance(view,memoryview)
+        self.assertEqual(store.staging_bytes,store.records['0:1']['bytes'])
+        self.assertEqual(store.active_reads,0)
+        self.assertIn('0:1',store.pending)
+        self.assertFalse(store.pending['0:1'].claimed)
+        view.release()
+        with store.read('0:1') as data:
+            self.assertEqual(hashlib.sha256(data).hexdigest(),store.records['0:1']['sha256'])
+        self.assertEqual(store.staging_bytes,0)
+        self.assertNotIn('0:1',store.pending)
+        store.close()
+        self.assertIsNone(store.fd)
+
+    @requires_posix_reads
     def test_hash_failure_and_short_read_never_yield_bytes(self):
         for failure in ('corrupt','eof'):
             store=self.store();real=os.pread
