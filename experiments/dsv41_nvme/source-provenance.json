@@ -8,8 +8,25 @@
       "extracted_without_code_changes": true
     },
     "expert_cache.py": {
-      "sha256": "7f03bf121ed6c6c0f30ac0633be600f691beb75153f9b6c034ca207acc08ae2b",
-      "extracted_without_code_changes": true
+      "sha256": "688d64d3ea80232415165603a21e00f9fcae93645506c986de4bf80baf9bad84",
+      "extracted_without_code_changes": false,
+      "original_extraction_sha256": "7f03bf121ed6c6c0f30ac0633be600f691beb75153f9b6c034ca207acc08ae2b",
+      "review_repair": {
+        "id": "PR19-L1",
+        "subject": "expert_cache.py lease() recorded the eviction-gating CUDA event on the stream current at RELEASE, not on the stream that owned the lease",
+        "patch": "patches/expert_cache.lease-owning-stream.patch",
+        "patch_sha256": "ead1ba0db1362843c3de49a7be1d5860a43ef4ceb79ea58cfc177a7cc77d39da",
+        "target_sha256": "688d64d3ea80232415165603a21e00f9fcae93645506c986de4bf80baf9bad84",
+        "original_extraction_sha256_verified_from": "git show 44954eb:experiments/dsv41_nvme/expert_cache.py | sha256sum (the pre-repair blob in this repository, an exclusive clone)",
+        "what_changed": "one line added in the acquisition block (owning_stream = torch.cuda.current_stream(self.device)) and one call site changed in the release path (event.record(owning_stream) instead of event.record(torch.cuda.current_stream(self.device))), plus a docstring on lease() that states the stream contract and the consumer obligation",
+        "design_note": "the owning stream is a per-LEASE local, deliberately NOT a field on Entry: an Entry can be leased concurrently by several callers on different streams, so a shared field would let the last writer decide every lease's gating event",
+        "what_did_not_change": "arena ownership, Regions allocation/release arithmetic, capacity/layer-quota checks, the host RAM and swap gate, hit/miss/eviction accounting, the completed-event drop on the hit path, the cache lock discipline, the ordering of event-record before users-decrement, and every other module: bytes and cache behaviour are preserved",
+        "contract_now_enforced_documentedly": "the consumer must run the lease body on the stream captured at acquisition (normally by acquiring inside torch.cuda.stream(s)) and must not switch streams inside the body; _evict() then synchronizes an event that does carry a happens-before edge to the consumer's kernels even when the caller releases after its stream block has exited",
+        "evidence_cpu": "experiments/dsv41_nvme/test_lease_stream_contract.py (4 checks, CPU, torch.cuda replaced by a recording test double): 3/4 fail against the pre-repair blob 7f03bf12 and 4/4 pass against the repaired blob",
+        "evidence_cpu_scope": "contract-level only; the double records which stream object each event is recorded on and makes no CUDA call, so it is not GPU evidence",
+        "evidence_gpu": "experiments/dsv41_nvme/test_lease_stream_cuda.py is prepared and GATED (DSV41_NVME_CUDA_CONTRACT=1 plus a device) but NOT RUN on this host: no CUDA receipt is claimed for the repair",
+        "qualification_status": "UNQUALIFIED on hardware: run the opt-in fixture on a GPU host before any serving promotion"
+      }
     },
     "async_store.py": {
       "sha256": "be242ba5ae23c2f35978a5d464856c4afa8a85efb3247e0bc5040b3731491275",

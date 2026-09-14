@@ -146,19 +146,50 @@ staging storage or recycling slots; CUDA-context failure requires worker
 termination. Its host RAM/swap check is a guard for Spark unified memory, not
 a replacement for cgroup limits and an external watchdog.
 
-### Lease stream ownership and lifetime (reviewed, not GPU-qualified)
+### Lease stream ownership and lifetime (repaired; CPU-contract-tested, NOT GPU-qualified)
 
-`ExpertCache.lease()` documents no stream contract, so the invariant it assumes
-is recorded here instead. The completion event that gates eviction is recorded
-on `torch.cuda.current_stream(device)` **at release time**, while `_evict()`
-synchronizes exactly those events before clearing the `LinearEXL3` handles and
-returning the arena range to `Regions`.
+`ExpertCache.lease()` now documents and implements its stream contract: the
+owning stream is captured **at acquisition**, per lease, in a local variable -
+never on the shared `Entry`, because one entry can be leased concurrently by
+different callers on different streams, and a shared field would let the last
+writer pick every gating event. The release path records the eviction-gating
+event on that captured stream, and `_evict()` synchronizes exactly those events
+before clearing the `LinearEXL3` handles and returning the arena range to
+`Regions`.
 
-- Caller obligation: acquire, use and release one lease on **one** stream. If a
-  lease is acquired and used inside `torch.cuda.stream(s)` but released after
-  that context exits, the event is recorded on the outer stream, which has no
-  happens-before edge to the work on `s`; eviction could then synchronize an
-  already-complete event and recycle storage still being read on `s`.
+- Why it changed: the release path used to record on
+  `torch.cuda.current_stream(device)` **at release time**. A lease acquired and
+  used inside `torch.cuda.stream(s)` but released after that block exits
+  therefore carried no happens-before edge to the work on `s`; eviction could
+  synchronize an already-complete event and recycle storage still being read on
+  `s`.
+- Consumer obligation (documented on `lease()`): run the lease body on the
+  stream captured at acquisition - normally by acquiring inside
+  `torch.cuda.stream(s)` - and do not switch streams inside the body.
+- Preserved: arena ownership, `Regions` allocation arithmetic, capacity and
+  layer-quota checks, the host RAM/swap gate, hit/miss/eviction accounting, the
+  completed-event drop on the hit path, and the ordering of event-record before
+  `users` decrement. The repair is two lines of behaviour plus a docstring.
+- CPU contract evidence: `test_lease_stream_contract.py` (4 checks) runs with
+  `torch.cuda` replaced by a documented recording test double - **contract-level
+  only, not GPU evidence**. It is RED against the pre-repair bytes (3 of 4
+  checks fail: release after the stream block exits records on the release-time
+  stream; nested leases on two streams both land on one stream) and GREEN
+  against the repaired bytes.
+- GPU fixture prepared and deliberately NOT RUN here:
+  `test_lease_stream_cuda.py` is opt-in via `DSV41_NVME_CUDA_CONTRACT=1` plus a
+  device. It uses real streams and real `torch.cuda.Event`, a 1 MiB arena and no
+  model, weights, exllamav3 or large cache, and discriminates on stream
+  occupancy rather than timing luck (the pre-repair release lands on the
+  deliberately busy release-time stream, the repaired one on the lease's own
+  stream). No CUDA receipt is claimed for this repair.
+- Provenance: `expert_cache.py` is no longer byte-identical to its extraction.
+  `source-provenance.json` now pins both the original extraction hash
+  (`original_extraction_sha256`) and the repaired bytes, with a hash-pinned
+  patch artifact under `patches/`; `test_provenance.py` verifies the live hash,
+  the patch hash and the patch's removed/added lines against the live source,
+  and has no skip or tolerance path. The other three implementations remain
+  byte-pinned and unchanged.
 - Lifetime: a caller must not retain `entry` or its projections after the
   `with` block. The arena range is only protected while `users > 0`, and the
   projections are cleared on eviction.
@@ -170,11 +201,14 @@ returning the arena range to `Regions`.
 - Event accounting is bounded: a completed event is dropped only on the hit
   path, and a freshly loaded entry starts with none, so growth tracks in-flight
   leases rather than total leases.
-- Not qualified here: whether recording on the acquisition stream (or asserting
-  release-on-use-stream) is the better fix needs a GPU, and all four
-  implementations are byte-pinned by `source-provenance.json`, so no source
-  edit is made. `expert_cache.py` remains NOT RUN on this host; no CUDA receipt
-  is claimed for it.
+- Not qualified here: the repaired lease path, `_load()`, the arena and the
+  `LinearEXL3` projections are still NOT RUN on this host (no GPU, no
+  exllamav3), so the repair is unqualified on hardware and must not be promoted
+  to serving before the opt-in fixture (or an equivalent GPU review) passes.
+- Not addressed here: a consumer that switches streams inside the lease body
+  still has no covered edge. The documented obligation is to use the captured
+  stream; asserting that at runtime was rejected as a larger behavioural change
+  than this review's scope.
 
 Full-model throughput remains slow. Isolated cache hits or overlapping reads
 are not evidence of a serving speedup. CUDA graphs, DSpark and larger-context
