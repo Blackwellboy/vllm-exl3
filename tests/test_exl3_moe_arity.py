@@ -1,6 +1,9 @@
 """CPU tests for the exl3_moe binding-arity detection that keeps the fused launch working
 across exllamav3 1.4.x (30 positional arguments) and 1.5.0 (35)."""
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -59,23 +62,76 @@ def test_unknown_arity_gets_no_tail():
     assert exl3._exl3_moe_tail(fn, 2048) == ()
 
 
-def test_launch_pads_only_the_1_5_0_binding(monkeypatch):
-    # Drive the exact call expression used in apply_exl3_fused_moe.
+def _pybind_binding(n_args: int) -> _Bound:
+    return _Bound(_pybind_doc(n_args))
+
+
+def _fused_layer(*, k: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        _exl3_ptrs={
+            key: object()
+            for key in (
+                "gate_trellis",
+                "gate_suh",
+                "gate_svh",
+                "up_trellis",
+                "up_suh",
+                "up_svh",
+                "down_trellis",
+                "down_suh",
+                "down_svh",
+            )
+        },
+        _exl3_fused_temps=(
+            torch.zeros(1, exl3.TEMP_ROWS_FUSED, 16, dtype=torch.float16),
+            None,
+            None,
+            None,
+        ),
+        _exl3_k=k,
+    )
+
+
+def _record_fused_launch(
+    monkeypatch: pytest.MonkeyPatch, n_args: int, *, k: int
+) -> list[tuple]:
+    """Run the real fused entry point against a binding of ``n_args`` positional args."""
+    fn = _pybind_binding(n_args)
+    monkeypatch.setattr(exl3, "get_moe_kernel_backend", lambda: "exllamav3")
+    monkeypatch.setitem(sys.modules, "exllamav3_ext", SimpleNamespace(exl3_moe=fn))
+    exl3.apply_exl3_fused_moe(
+        torch.zeros(2, 16, dtype=torch.float16),
+        torch.zeros(2, 1, dtype=torch.long),
+        torch.ones(2, 1),
+        _fused_layer(k=k),
+        [{}],
+        None,
+    )
+    return fn.calls
+
+
+def test_fused_launch_pads_exactly_the_binding_arity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The launch itself, not a copy of its call expression: args + num_active, plus the
+    # 1.5.0 tail only when the bound arity has room for it.
     for n_args, expect in ((30, 30), (35, 35)):
-        fn = _Bound(_pybind_doc(n_args))
-        args = tuple(range(29))
-        n_active_host = -1 if exl3._exl3_moe_accepts_num_active(fn) else None
-        tail = exl3._exl3_moe_tail(fn, 2048)
-        if tail and n_active_host is None:
-            n_active_host = -1
-        if n_active_host is not None:
-            fn(*args, n_active_host, *tail)
-        else:
-            fn(*args)
-        assert len(fn.calls[0]) == expect, (n_args, len(fn.calls[0]))
-        if n_args == 35:
-            assert fn.calls[0][29] == -1
-            assert fn.calls[0][30:] == (None, None, 1, 2048, 16)
+        call = _record_fused_launch(monkeypatch, n_args, k=4)[0]
+        assert len(call) == expect, (n_args, len(call))
+        assert call[29] == -1
+        assert call[10:13] == (4, 4, 4)
+        assert call[30:] == (
+            (None, None, 1, exl3.TEMP_ROWS_FUSED, 16) if n_args == 35 else ()
+        )
+
+
+def test_fused_launch_carries_each_layers_own_k(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Mixed-K stacks: the launch takes K from the layer it belongs to, never a global.
+    for k, n_args in ((2, 30), (3, 30), (5, 35)):
+        call = _record_fused_launch(monkeypatch, n_args, k=k)[0]
+        assert call[10:13] == (k, k, k), (k, n_args)
 
 
 def test_temp_rows_from_buffers_or_default():

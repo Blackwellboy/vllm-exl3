@@ -6,6 +6,8 @@
 
 - exllamav3 1.5.0 support for the fused routed-expert launch. 1.5.0 appended five positional arguments to `exl3_moe` (`output_scratch`, `fused_base`, `count_lo`, `count_hi`, `m_tile`) for its deterministic-accumulation and row-tile modes; the plugin now reads the binding's arity from its pybind signature and, on 1.5.0, passes the values that reproduce the 1.4.x all-fused atomic launch (`None, None, 1, <temp rows>, 16`). 1.4.x bindings are called exactly as before. `runtime_diagnostics()` records the detected arity as `exllamav3_exl3_moe_arity`. Measured on one GB10 with Qwen3.8-Flash-Next 3.05 bpw at the recipe's envelope config: 52.05 tok/s at MTP k=3 on 1.5.0 against 52.22 on 1.4.7, 28.54 against 27.77 without a draft, prefill unchanged. Kernel version is not a speed lever on this hardware; the change is about running on current upstream. Tests: `tests/test_exl3_moe_arity.py`.
 
+- `tools/gb10_exl3_moe_parity.py`: on-hardware probe for the same launch — one launch per per-layer K against the native `exl3_gemv` map, plus the check that a 1.5.0 binding rejects the 1.4.x arity. `--dry-run` exercises the argument assembly on CPU.
+
 ## 0.4.2 (2026-09-09)
 
 ### Fixed
