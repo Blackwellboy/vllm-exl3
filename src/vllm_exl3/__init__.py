@@ -108,6 +108,13 @@ def runtime_diagnostics():
         ),
         per_bit_policy_installed=installed,
     )
+    # Which exllamav3 exl3_moe binding loaded: 30 positional args through 1.4.x, 35 from
+    # 1.5.0. None when exllamav3 is not importable here.
+    try:
+        _ext = exl3.load_exllamav3_ext()
+        record["exllamav3_exl3_moe_arity"] = exl3._exl3_moe_arity(_ext.exl3_moe)
+    except Exception:
+        record["exllamav3_exl3_moe_arity"] = None
     record["mixed_k"] = {
         "config_bits": list(supported_config_bits()),
         "exllamav3_moe_kernel_bits": list(range(1, 9)),
