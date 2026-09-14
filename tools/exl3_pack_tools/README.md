@@ -54,8 +54,19 @@ per-projection packed K and signed MUL1 markers. It does not requantize.
 
 ```sh
 python3 tools/exl3_pack_tools/compact_safetensors.py source.safetensors repaired.safetensors > receipts.json
-python3 -m pytest -q tests/test_compact_safetensors.py
+python3 -m pytest -q tests/test_compact_safetensors.py tests/test_compact_safetensors_attestation.py
 ```
+
+Publication is fail-closed. After the copy is flushed and fsynced - and before
+the finished file is linked into place - the tool (1) re-opens it with the real
+`safetensors` parser and requires the parsed names, dtypes, shapes and metadata
+to match the written header, and (2) streams the written file back and recomputes
+a SHA256 for every tensor directly from the destination bytes. If the parser
+cannot be imported, rejects the file, or either digest disagrees, the run aborts
+and no destination appears. Every tensor receipt therefore carries `sha256`
+(source bytes as copied) *and* `destination_sha256` (read back from the file that
+would be published); the CLI report adds a `parser` block naming the module,
+version and verified tensor count.
 
 The destination must not exist. The tool rejects overlaps, truncation,
 duplicate JSON keys and inconsistent shapes, and streams with a 1 MiB copy

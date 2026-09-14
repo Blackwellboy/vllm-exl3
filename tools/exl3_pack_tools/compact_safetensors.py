@@ -1,11 +1,14 @@
 """Copy tensor bytes into a gap-free safetensors file without requantization.
 
 The source is never changed. A new destination is published only after the
-complete copy is synced; an existing destination is never replaced.
+complete copy is synced, re-parsed by the real safetensors parser, and read
+back tensor-by-tensor from the written file; an existing destination is never
+replaced.
 """
 
 import argparse
 import hashlib
+import importlib
 import json
 import math
 import os
@@ -22,6 +25,11 @@ WIDTH = {
 }
 MAX_HEADER_BYTES = 32 * 1024**2
 COPY_BYTES = 1024**2
+PARSER_MODULE = "safetensors"
+# "np" is the only backend that exposes out-of-line tense layouts without a
+# heavy torch/tensorflow import. get_slice() reports shape and dtype for every
+# safetensors dtype, including BF16/F8 which NumPy cannot materialize.
+PARSER_FRAMEWORK = "np"
 
 
 def _unique_object(pairs):
@@ -85,6 +93,67 @@ def encode_header(header):
     return raw + b" " * (-len(raw) % 8)
 
 
+def load_parser():
+    """Fail closed: without the real parser nothing may be published."""
+    try:
+        return importlib.import_module(PARSER_MODULE)
+    except ImportError as error:
+        raise ValueError(
+            f"{PARSER_MODULE} parser unavailable; refusing to publish an unverified copy"
+        ) from error
+
+
+def parser_layout(parser, path, header):
+    """Re-open the written file with the real parser and confirm its layout."""
+    expected = {name: (item["dtype"], item["shape"])
+                for name, item in header.items() if name != "__metadata__"}
+    try:
+        with parser.safe_open(str(path), framework=PARSER_FRAMEWORK) as handle:
+            names = list(handle.keys())
+            if set(names) != set(expected):
+                raise ValueError("Parser tensor names disagree with the written header")
+            for name in names:
+                view = handle.get_slice(name)
+                if list(view.get_shape()) != list(expected[name][1]):
+                    raise ValueError(f"Parser shape disagrees with the written header: {name}")
+                if view.get_dtype() != expected[name][0]:
+                    raise ValueError(f"Parser dtype disagrees with the written header: {name}")
+            metadata = handle.metadata() or {}
+    except parser.SafetensorError as error:
+        raise ValueError(f"Parser rejected the copied file: {error}") from error
+    if metadata != (header.get("__metadata__") or {}):
+        raise ValueError("Parser metadata disagrees with the written header")
+    return names
+
+
+def readback_receipts(path, header_length, receipts):
+    """Stream the written file back; every tensor digest is recomputed there."""
+    with Path(path).open("rb") as written:
+        start = 8 + header_length
+        for receipt in receipts:
+            written.seek(start + receipt["destination_start"])
+            remaining, digest = receipt["bytes"], hashlib.sha256()
+            while remaining:
+                block = written.read(min(COPY_BYTES, remaining))
+                if not block:
+                    raise ValueError("Destination data is shorter than the written header")
+                digest.update(block)
+                remaining -= len(block)
+            receipt["destination_sha256"] = digest.hexdigest()
+            if receipt["destination_sha256"] != receipt["sha256"]:
+                raise ValueError(
+                    f"Destination bytes disagree with the copied source: {receipt['name']}"
+                )
+    return receipts
+
+
+def verify_before_publish(path, header_length, header, receipts):
+    """Both attestations run on the finished file, before anything is published."""
+    parser = load_parser()
+    parser_layout(parser, path, header)
+    return readback_receipts(path, header_length, receipts)
+
+
 def compact_file(source, destination):
     """Return SHA256 receipts for the bytes copied for each tensor."""
     source, destination = Path(source), Path(destination)
@@ -125,6 +194,7 @@ def compact_file(source, destination):
                 final.st_size, final.st_mtime_ns, final.st_ctime_ns
             ):
                 raise ValueError("Source changed during copy")
+            verify_before_publish(temporary, len(raw), fixed, receipts)
             # Same-filesystem link is atomic and refuses a concurrent destination.
             os.link(temporary, destination)
         finally:
@@ -148,6 +218,12 @@ def main():
         "destination_bytes": destination_bytes,
         # Signed delta so a caller can attest that only unreferenced bytes moved.
         "discarded_bytes": source_bytes - destination_bytes,
+        # The copy is only published after this parser opened the written file.
+        "parser": {"module": PARSER_MODULE,
+                   "version": getattr(load_parser(), "__version__", "unknown"),
+                   "verified_tensors": len(receipts)},
+        # Every receipt carries the source digest and the digest read back from
+        # the published file's own bytes.
         "tensors": receipts,
     }, indent=2))
 
