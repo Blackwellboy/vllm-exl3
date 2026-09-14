@@ -6,6 +6,7 @@ import threading
 import unittest
 from unittest.mock import patch
 from expert_store import ALIGN, ExpertStore, Regions, build_bank
+from posix_support import requires_posix_reads
 
 
 class RegionsTests(unittest.TestCase):
@@ -36,6 +37,7 @@ class StoreTests(unittest.TestCase):
         AsyncStoreTests.tearDownClass()
         cls.tmp.cleanup()
 
+    @requires_posix_reads
     def test_every_tensor_byte_hash_matches(self):
         s=ExpertStore(self.bank,self.digest,direct=False)
         try:
@@ -56,6 +58,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(s.reads,0)
         finally:s.close()
 
+    @requires_posix_reads
     def test_interrupted_syscall_retries_and_eof_fails(self):
         import os
         s=ExpertStore(self.bank,self.digest,direct=False);real=os.pread;calls=[0]
@@ -72,6 +75,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(s.active_reads,0)
         finally:s.close()
 
+    @requires_posix_reads
     def test_corrupt_record_rejected(self):
         import os
         s=ExpertStore(self.bank,self.digest,direct=False);real=os.pread

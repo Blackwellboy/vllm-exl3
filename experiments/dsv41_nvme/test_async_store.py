@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from expert_store import build_bank
 from async_store import AsyncExpertStore
+from posix_support import requires_posix_reads
 
 
 class AsyncStoreTests(unittest.TestCase):
@@ -38,6 +39,7 @@ class AsyncStoreTests(unittest.TestCase):
 
     def store(self,**kwargs):return AsyncExpertStore(self.bank,self.digest,direct=False,**kwargs)
 
+    @requires_posix_reads
     def test_two_reads_overlap_and_completed_buffers_remain_bounded(self):
         store=self.store();real=os.pread;barrier=threading.Barrier(2);seen=set();lock=threading.Lock()
         def overlapped(*args):
@@ -60,6 +62,7 @@ class AsyncStoreTests(unittest.TestCase):
         finally:store.close()
         self.assertIsNone(store.fd)
 
+    @requires_posix_reads
     def test_unplanned_demand_replaces_only_unleased_work(self):
         store=self.store()
         try:
@@ -76,6 +79,7 @@ class AsyncStoreTests(unittest.TestCase):
         finally:store.close()
         self.assertEqual(store.staging_bytes,0)
 
+    @requires_posix_reads
     def test_exported_view_prevents_recycling_and_can_be_released(self):
         store=self.store()
         with self.assertRaises(BufferError):
@@ -85,6 +89,7 @@ class AsyncStoreTests(unittest.TestCase):
         store.close()
         self.assertEqual(store.staging_bytes,0)
 
+    @requires_posix_reads
     def test_hash_failure_and_short_read_never_yield_bytes(self):
         for failure in ('corrupt','eof'):
             store=self.store();real=os.pread
@@ -100,6 +105,7 @@ class AsyncStoreTests(unittest.TestCase):
                 self.assertEqual(store.async_stats['failed'],1)
             finally:store.close()
 
+    @requires_posix_reads
     def test_cancel_and_replan_release_unused_records(self):
         store=self.store();cancel=threading.Event();cancel.set()
         try:
@@ -112,6 +118,7 @@ class AsyncStoreTests(unittest.TestCase):
             self.assertEqual(store.staging_bytes,0)
         finally:store.close()
 
+    @requires_posix_reads
     def test_interrupted_syscall_retries_and_closed_store_rejects_work(self):
         store=self.store();real=os.pread;count=[0]
         def interrupted(*args):

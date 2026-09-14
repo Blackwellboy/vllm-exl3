@@ -6,8 +6,10 @@ import threading
 import unittest
 from unittest.mock import patch
 from engram_rows import EngramRows
+from posix_support import requires_posix_reads
 
 
+@requires_posix_reads
 class EngramRowTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();root=Path(self.temp.name)

@@ -1,3 +1,5 @@
+# POSIX-only: these components call os.pread/os.preadv directly and never
+# substitute another syscall, so this job needs a POSIX runner.
 name: Experimental NVMe component checks
 on:
   pull_request:
