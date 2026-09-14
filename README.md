@@ -195,7 +195,7 @@ Set controls **before starting the serving process**, and restart that process b
 | `VLLM_EXL3_GROUPED_PREFILL_MAX_ROWS` | Planner row-window budget, not a live kernel allocation setting |
 | `VLLM_EXL3_REQUIRE_UVA_EXPERTS=1` | Require complete mapped-UVA placement of the six large EXL3 MoE payload segments before post-load handle construction |
 | `VLLM_EXL3_NGRAM_KERNEL=ext\|torch` | n-gram row decoder: the compiled `exllamav3_ext.ngram_dequant` kernel (default) or the pure-torch twin |
-| `VLLM_EXL3_NGRAM_TABLE=resident\|disk` | Where the packed n-gram table lives. `resident` (default): one int16 device tensor. `disk`: the checkpoint's memory-mapped views stay the table and each lookup gathers its rows on the host, so the table costs page cache instead of 32 to 36 GiB of device memory; needs `--compilation-config '{"cudagraph_mode": "PIECEWISE", "splitting_ops": [<attention ops>, "vllm::exl3_ngram_lookup"]}'` because the host gather cannot sit inside a captured graph |
+| `VLLM_EXL3_NGRAM_TABLE=resident\|disk` | Where the packed n-gram table lives. `resident` (default): one int16 device tensor. `disk`: the checkpoint's memory-mapped views stay the table and each lookup gathers its rows on the host, so the table costs page cache instead of 32 to 36 GiB of device memory; needs `--compilation-config '{"cudagraph_mode": "PIECEWISE", "splitting_ops": [<attention ops>, "vllm::exl3_ngram_lookup_out"]}'` because the host gather cannot sit inside a captured graph |
 
 In a **fresh process in the intended runtime environment**, explicitly register before inspecting the policy:
 

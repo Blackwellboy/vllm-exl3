@@ -2968,11 +2968,11 @@ def _check_ngram_disk_graph_mode() -> None:
             f"{NGRAM_TABLE_ENV}=disk needs PIECEWISE CUDA graphs with the lookup kept "
             "eager; got cudagraph_mode=%s. Pass --compilation-config with "
             '{"cudagraph_mode": "PIECEWISE", "splitting_ops": [<the attention ops>, '
-            '"vllm::exl3_ngram_lookup"]}' % name
+            '"vllm::exl3_ngram_lookup_out"]}' % name
         )
-    if ops and "vllm::exl3_ngram_lookup" not in ops:
+    if ops and "vllm::exl3_ngram_lookup_out" not in ops:
         raise RuntimeError(
-            f"{NGRAM_TABLE_ENV}=disk: add \"vllm::exl3_ngram_lookup\" to splitting_ops so "
+            f"{NGRAM_TABLE_ENV}=disk: add \"vllm::exl3_ngram_lookup_out\" to splitting_ops so "
             "the host gather runs outside the piecewise graphs"
         )
 
@@ -3226,7 +3226,17 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         name = getattr(layer, "_exl3_opaque_name", None)
         if name is not None and _EXL3_OPS_READY:
-            return torch.ops.vllm.exl3_ngram_lookup(input_, name)
+            # Out-variant on purpose. When this op is a splitting op (disk mode), the
+            # piecewise CUDA graph after it was captured reading its input at one
+            # address; a fresh tensor returned from an eager op lands anywhere. The
+            # buffer is allocated here, inside the piece before the split, so its
+            # address is the graph's own and stable across replays, the same way
+            # vLLM's attention and PLE ops take their output as an argument.
+            out = torch.empty(
+                *input_.shape, NGRAM_ROW_DIM, dtype=layer._exl3_ngram_dtype, device=input_.device
+            )
+            torch.ops.vllm.exl3_ngram_lookup_out(input_, name, out)
+            return out
         return self._embedding_impl(layer, input_)
 
     def _embedding_impl(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
@@ -3245,7 +3255,7 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         checkpoint, one upload, decode on the device, expand back.
 
         The device-to-host copy is a synchronization point, so this op must run
-        eagerly: PIECEWISE CUDA graphs with ``vllm::exl3_ngram_lookup`` in
+        eagerly: PIECEWISE CUDA graphs with ``vllm::exl3_ngram_lookup_out`` in
         ``splitting_ops``. Under a FULL graph the copy cannot be captured.
         """
         ids = input_.reshape(-1).to(torch.int64)
@@ -3318,6 +3328,15 @@ def _exl3_ngram_lookup_fake(ids: torch.Tensor, layer_name: str) -> torch.Tensor:
     return ids.new_empty(*ids.shape, NGRAM_ROW_DIM, dtype=layer._exl3_ngram_dtype)
 
 
+def _exl3_ngram_lookup_out_op(ids: torch.Tensor, layer_name: str, out: torch.Tensor) -> None:
+    layer = _EXL3_OPAQUE_LAYERS[layer_name]
+    out.copy_(layer.quant_method._embedding_impl(layer, ids))
+
+
+def _exl3_ngram_lookup_out_fake(ids: torch.Tensor, layer_name: str, out: torch.Tensor) -> None:
+    return None
+
+
 def _exl3_register_custom_ops() -> bool:
     global _EXL3_OPS_READY
     if _EXL3_OPS_READY:
@@ -3343,6 +3362,13 @@ def _exl3_register_custom_ops() -> bool:
                 op_func=_exl3_ngram_lookup_op,
                 mutates_args=[],
                 fake_impl=_exl3_ngram_lookup_fake,
+            )
+        if not hasattr(torch.ops.vllm, "exl3_ngram_lookup_out"):
+            direct_register_custom_op(
+                op_name="exl3_ngram_lookup_out",
+                op_func=_exl3_ngram_lookup_out_op,
+                mutates_args=["out"],
+                fake_impl=_exl3_ngram_lookup_out_fake,
             )
     except Exception as exc:  # pragma: no cover - registration is best effort
         logger.warning("EXL3 custom op registration failed; eager fallback: %r", exc)
