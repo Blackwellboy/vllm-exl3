@@ -31,14 +31,7 @@ def _loaded_shard_ids(
 
 
 def install_mixed_bf16_madv_compat(module: Any) -> None:
-    """Reclaim CPU safetensors pages after the mixed-BF16 direct H2D branch.
-
-    ``Exl3LinearMethod._make_weight_loader`` has a special ``weight`` branch for
-    BF16 shards.  The branch copies directly into a CUDA staging parameter and
-    returns before the ordinary post-H2D MADV path.  Wrap the generated loader so
-    the consumed source (or fully consumed fused source) is synchronized and
-    reclaimed using the same view/VMA-bounded helper as the rest of the loader.
-    """
+    """Reclaim CPU safetensors pages after the mixed-BF16 direct H2D branch."""
     cls = getattr(module, "Exl3LinearMethod", None)
     if cls is None:
         return
@@ -92,8 +85,6 @@ def install_mixed_bf16_madv_compat(module: Any) -> None:
                         torch.cuda.current_stream().synchronize()
                         module._madv_dontneed_cpu_tensor(loaded_weight)
                 except Exception:
-                    # Reclamation is an optimization/safety aid, never a reason
-                    # to make weight loading fail after a successful copy.
                     pass
             return result
 
@@ -102,3 +93,12 @@ def install_mixed_bf16_madv_compat(module: Any) -> None:
     wrapped_make._vllm_exl3_bf16_madv_wrapped = True
     cls._make_weight_loader = wrapped_make
     module._vllm_exl3_bf16_madv_compat_installed = True
+
+
+def register() -> None:
+    """vLLM plugin entry: install normal EXL3 plugin, then BF16 reclaim shim."""
+    import vllm_exl3
+    from vllm_exl3 import exl3
+
+    vllm_exl3.register()
+    install_mixed_bf16_madv_compat(exl3)
