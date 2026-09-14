@@ -18,7 +18,7 @@ Homepage = "https://github.com/vcruz305/vllm-exl3"
 Changelog = "https://github.com/vcruz305/vllm-exl3/blob/main/CHANGELOG.md"
 
 [project.entry-points."vllm.general_plugins"]
-vllm_exl3 = "vllm_exl3:register"
+vllm_exl3 = "vllm_exl3.bf16_madv_compat:register"
 
 [tool.setuptools.packages.find]
 where = ["src"]
