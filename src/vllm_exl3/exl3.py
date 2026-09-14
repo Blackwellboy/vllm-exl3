@@ -1076,6 +1076,16 @@ def _exl3_moe_arity(fn) -> int | None:
         return None
 
 
+def _exl3_moe_temp_rows(temps) -> int:
+    """Row capacity of the fused temp buffers ([concurrency, rows, width]); the module
+    default when a caller hands in placeholders instead of tensors."""
+    first = temps[0] if temps else None
+    shape = getattr(first, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        return int(shape[-2])
+    return int(TEMP_ROWS_FUSED)
+
+
 def _exl3_moe_tail(fn, temp_rows: int) -> tuple:
     """Trailing arguments exllamav3 1.5.0 added to exl3_moe, or () for older bindings.
 
@@ -1778,7 +1788,7 @@ def apply_exl3_fused_moe(
         float(limit) if (limit is not None and limit > 0) else 0.0,
     )
     # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
-    tail = _exl3_moe_tail(fn, int(temps[0].shape[-2]))
+    tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
     if tail and n_active_host is None:
         n_active_host = -1
     if n_active_host is not None:

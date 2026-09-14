@@ -76,3 +76,10 @@ def test_launch_pads_only_the_1_5_0_binding(monkeypatch):
         if n_args == 35:
             assert fn.calls[0][29] == -1
             assert fn.calls[0][30:] == (None, None, 1, 2048, 16)
+
+
+def test_temp_rows_from_buffers_or_default():
+    temps = (torch.zeros(2, 512, 8), None, None, None)
+    assert exl3._exl3_moe_temp_rows(temps) == 512
+    assert exl3._exl3_moe_temp_rows((None, None, None, None)) == exl3.TEMP_ROWS_FUSED
+    assert exl3._exl3_moe_temp_rows(None) == exl3.TEMP_ROWS_FUSED
