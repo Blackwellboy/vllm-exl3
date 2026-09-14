@@ -2979,6 +2979,65 @@ def ngram_dequant_rows_torch(
     return out
 
 
+NGRAM_TABLE_ENV = "VLLM_EXL3_NGRAM_TABLE"
+
+
+class _NgramDiskTable:
+    """The packed n-gram table as the checkpoint's own CPU views, one per shard.
+    Rows are gathered on the host; with memory-mapped views that is a page-cache
+    read, so the table costs no device memory and no anonymous RAM."""
+
+    def __init__(self, views: list[torch.Tensor], rows_per_shard: int) -> None:
+        self.views = views
+        self.rows_per_shard = int(rows_per_shard)
+        self.num_rows = sum(int(v.shape[0]) for v in views)
+
+    def gather(self, uids_cpu: torch.Tensor) -> torch.Tensor:
+        if len(self.views) == 1:
+            return self.views[0].index_select(0, uids_cpu)
+        shard = uids_cpu // self.rows_per_shard
+        local = uids_cpu - shard * self.rows_per_shard
+        out = torch.empty((uids_cpu.numel(), self.views[0].shape[1]), dtype=self.views[0].dtype)
+        for s in shard.unique().tolist():
+            m = shard == s
+            out[m] = self.views[s].index_select(0, local[m])
+        return out
+
+
+def _ngram_view_owner(param: Parameter) -> torch.nn.Module:
+    """The embedding layer a disk-mode shard parameter belongs to (set at create time)."""
+    owner = getattr(param, "_exl3_ngram_owner", None)
+    if owner is None:
+        raise RuntimeError("EXL3 n-gram (disk): shard parameter has no owning layer")
+    return owner
+
+
+def _check_ngram_disk_graph_mode() -> None:
+    """Disk mode synchronizes with the host inside the model forward; refuse the CUDA
+    graph modes that would capture that, and say what to pass instead."""
+    try:
+        from vllm.config import get_current_vllm_config
+
+        cfg = get_current_vllm_config().compilation_config
+    except Exception:
+        return
+    mode = getattr(cfg, "cudagraph_mode", None)
+    name = getattr(mode, "name", str(mode))
+    ops = list(getattr(cfg, "splitting_ops", None) or [])
+    if "FULL" in name:
+        raise RuntimeError(
+            f"{NGRAM_TABLE_ENV}=disk needs PIECEWISE CUDA graphs with the lookup kept "
+            "eager; got cudagraph_mode=%s. Pass --compilation-config with "
+            '{"cudagraph_mode": "PIECEWISE", "splitting_ops": [<the attention ops>, '
+            '"vllm::exl3_ngram_lookup_out"]}' % name
+        )
+    if ops and "vllm::exl3_ngram_lookup_out" not in ops:
+        raise RuntimeError(
+            f"{NGRAM_TABLE_ENV}=disk: add \"vllm::exl3_ngram_lookup_out\" to splitting_ops so "
+            "the host gather runs outside the piecewise graphs"
+        )
+
+
 class Exl3EmbeddingMethod(QuantizeMethodBase):
     """Row-wise EXL3 embedding table in exllamav3's n-gram format.
 
@@ -3002,12 +3061,29 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         self.rows_per_shard = int(spec["rows_per_shard"])
         self.num_heads = int(spec["num_heads"])
         self.words = ngram_words_per_row(self.bits)
+        # Checkpoint layout: ``shard_<i>.trellis`` (default) or one ``trellis`` tensor
+        # holding the whole table (the layout exllamav3 1.5.0-era packs ship).
+        self.sharded = bool(spec.get("sharded", True))
+        if not self.sharded and self.num_shards != 1:
+            raise ValueError(
+                "ngram_embedding: an unsharded table must declare num_shards=1, "
+                f"got {self.num_shards}"
+            )
         kernel = os.environ.get("VLLM_EXL3_NGRAM_KERNEL", "ext").strip().lower()
         if kernel not in ("ext", "torch"):
             raise ValueError(
                 f"VLLM_EXL3_NGRAM_KERNEL must be 'ext' or 'torch', got {kernel!r}"
             )
         self.kernel = kernel
+        # Where the packed table lives. ``resident``: one int16 device tensor (32.6 GiB
+        # for the Qwen3.8-Flash-Next 5-bit table). ``disk``: the loader keeps the
+        # checkpoint's memory-mapped views and every lookup gathers the rows it needs on
+        # the host, so the table costs page cache, not device memory. See
+        # ``_embedding_impl_disk`` for what that requires of the CUDA graph mode.
+        table_mode = os.environ.get(NGRAM_TABLE_ENV, "resident").strip().lower()
+        if table_mode not in ("resident", "disk"):
+            raise ValueError(f"{NGRAM_TABLE_ENV} must be 'resident' or 'disk', got {table_mode!r}")
+        self.table_mode = table_mode
         self._ext = None
 
     def create_weights(
@@ -3038,16 +3114,28 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         if int(tp_size) != 1:
             raise RuntimeError("EXL3 n-gram embedding supports tensor parallel size 1 only")
 
-        table = torch.empty(
-            self.num_shards, self.rows_per_shard, self.words, dtype=torch.int16
-        )
+        if self.table_mode == "resident":
+            table = torch.empty(
+                self.num_shards, self.rows_per_shard, self.words, dtype=torch.int16
+            )
+        else:
+            # Nothing resident: the loader keeps the checkpoint views (``_exl3_ngram_views``)
+            # and the parameters below are name anchors for vLLM's weight loader only.
+            table = None
+            layer._exl3_ngram_views = [None] * self.num_shards
         loaded: set[int] = set()
         for i in range(self.num_shards):
-            shard = torch.nn.Module()
-            p = Parameter(table[i], requires_grad=False)
+            data = table[i] if table is not None else torch.empty(0, dtype=torch.int16)
+            p = Parameter(data, requires_grad=False)
             p.weight_loader = self._make_shard_loader(i, loaded)
-            shard.register_parameter("trellis", p)
-            layer.add_module(f"shard_{i}", shard)
+            if table is None:
+                p._exl3_ngram_owner = layer
+            if self.sharded:
+                shard = torch.nn.Module()
+                shard.register_parameter("trellis", p)
+                layer.add_module(f"shard_{i}", shard)
+            else:
+                layer.register_parameter("trellis", p)
         aux = {
             "head_bias": Parameter(
                 torch.zeros(self.num_heads, NGRAM_ROW_DIM, dtype=torch.float16),
@@ -3074,6 +3162,7 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 
     def _make_shard_loader(self, index: int, loaded: set[int]):
         rows, words, bits = self.rows_per_shard, self.words, self.bits
+        disk = self.table_mode == "disk"
 
         def weight_loader(param: Parameter, loaded_weight: torch.Tensor, loaded_shard_id=None):
             del loaded_shard_id
@@ -3082,7 +3171,15 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
                     f"EXL3 n-gram shard {index}: expected int16 ({rows}, {words}) for "
                     f"K={bits}, got {loaded_weight.dtype} {tuple(loaded_weight.shape)}"
                 )
-            param.data.copy_(loaded_weight)
+            if disk:
+                # vLLM's safetensors iterator hands over a zero-copy view of the mapped
+                # file; holding it keeps the mapping alive and no row is read until a
+                # lookup touches it. A tensor that is not a plain CPU view (a loader
+                # that copied, or another device) is kept as-is and still works.
+                owner = _ngram_view_owner(param)
+                owner._exl3_ngram_views[index] = loaded_weight.detach()
+            else:
+                param.data.copy_(loaded_weight)
             loaded.add(index)
 
         return weight_loader
@@ -3105,7 +3202,7 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         table = getattr(layer, "_exl3_ngram_table", None)
-        if table is None:
+        if table is None and not hasattr(layer, "_exl3_ngram_views"):
             return
         loaded = layer._exl3_ngram_loaded
         missing = [i for i in range(self.num_shards) if i not in loaded]
@@ -3120,7 +3217,8 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
         ]
         if aux_missing:
             raise RuntimeError(f"EXL3 n-gram table: aux tensors never loaded: {aux_missing}")
-        if layer.shard_0.trellis.data_ptr() != table.data_ptr():
+        first = layer.shard_0.trellis if self.sharded else layer.trellis
+        if table is not None and first.data_ptr() != table.data_ptr():
             raise RuntimeError(
                 "EXL3 n-gram shard parameters no longer alias the packed table; refusing to serve"
             )
@@ -3137,7 +3235,16 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
                 f"EXL3 n-gram head layout inconsistent with the table: offsets={offs} "
                 f"sizes={sizes} rows={total_rows}"
             )
-        layer._exl3_ngram_rows = table.view(-1, self.words)
+        if table is not None:
+            layer._exl3_ngram_rows = table.view(-1, self.words)
+        else:
+            views = layer._exl3_ngram_views
+            if any(v is None for v in views):
+                raise RuntimeError("EXL3 n-gram table (disk): a shard view was never captured")
+            layer._exl3_ngram_rows = None
+            layer._exl3_ngram_disk = _NgramDiskTable(views, self.rows_per_shard)
+            layer._exl3_ngram_head_offsets_cpu = layer.head_offsets.data.detach().cpu().contiguous()
+            _check_ngram_disk_graph_mode()
         layer._exl3_ngram_head_offsets = layer.head_offsets.data.contiguous()
         layer._exl3_ngram_head_bias = layer.head_bias.data.contiguous()
         layer._exl3_opaque_name = _exl3_register_opaque_layer(layer, "ngram")
@@ -3152,10 +3259,12 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
                 )
                 self.kernel = "torch"
         logger.info(
-            "EXL3 n-gram embedding ready: %d shards x %d rows, K=%d, %d heads, "
-            "%.2f GiB packed, kernel=%s",
-            self.num_shards, self.rows_per_shard, self.bits, self.num_heads,
-            table.numel() * 2 / 2**30, self.kernel,
+            "EXL3 n-gram embedding ready: %d shards x %d rows (%s), K=%d, %d heads, "
+            "%.2f GiB packed, table=%s, kernel=%s",
+            self.num_shards, self.rows_per_shard,
+            "sharded" if self.sharded else "unsharded", self.bits, self.num_heads,
+            self.num_shards * self.rows_per_shard * self.words * 2 / 2**30,
+            self.table_mode, self.kernel,
         )
 
     def _lookup_packed(self, layer: torch.nn.Module, ids_flat: torch.Tensor) -> torch.Tensor:
@@ -3175,19 +3284,70 @@ class Exl3EmbeddingMethod(QuantizeMethodBase):
             return out
         return ngram_dequant_rows_torch(packed, self.bits, heads, bias)
 
+    def _ngram_lookup_uses_out_variant(self, layer: torch.nn.Module) -> bool:
+        """Whether this lookup has to write into a caller-allocated buffer.
+
+        Only the opt-in disk table needs it. There the lookup runs eagerly as a
+        CUDA-graph splitting op, so the output buffer must be allocated in the
+        piece before the split. The resident table keeps the mainline returning
+        op, so nothing about the default path changes.
+        """
+        return getattr(layer, "_exl3_ngram_disk", None) is not None
+
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         name = getattr(layer, "_exl3_opaque_name", None)
         if name is not None and _EXL3_OPS_READY:
-            return torch.ops.vllm.exl3_ngram_lookup(input_, name)
+            if not self._ngram_lookup_uses_out_variant(layer):
+                return torch.ops.vllm.exl3_ngram_lookup(input_, name)
+            # Out-variant on purpose, and reachable only with
+            # ``VLLM_EXL3_NGRAM_TABLE=disk``. When this op is a splitting op (disk
+            # mode), the piecewise CUDA graph after it was captured reading its
+            # input at one address; a fresh tensor returned from an eager op lands
+            # anywhere. The buffer is allocated here, inside the piece before the
+            # split, so its address is the graph's own and stable across replays,
+            # the same way vLLM's attention and PLE ops take their output as an
+            # argument.
+            out = torch.empty(
+                *input_.shape, NGRAM_ROW_DIM, dtype=layer._exl3_ngram_dtype, device=input_.device
+            )
+            torch.ops.vllm.exl3_ngram_lookup_out(input_, name, out)
+            return out
         return self._embedding_impl(layer, input_)
 
     def _embedding_impl(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        if getattr(layer, "_exl3_ngram_disk", None) is not None:
+            return self._embedding_impl_disk(layer, input_)
         if getattr(layer, "_exl3_ngram_rows", None) is None:
             raise RuntimeError("EXL3 n-gram table was not finalized after weight load")
         ids = input_.reshape(-1).to(torch.int64)
         packed = self._lookup_packed(layer, ids)
         heads = self._heads_for(layer, ids)
         out = self._decode(layer, packed, heads)
+        return out.to(layer._exl3_ngram_dtype).view(*input_.shape, NGRAM_ROW_DIM)
+
+    def _embedding_impl_disk(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        """Host-gathered lookup: unique row ids to the CPU, rows from the mapped
+        checkpoint, one upload, decode on the device, expand back.
+
+        The device-to-host copy is a synchronization point, so this op must run
+        eagerly: PIECEWISE CUDA graphs with ``vllm::exl3_ngram_lookup_out`` in
+        ``splitting_ops``. Under a FULL graph the copy cannot be captured.
+        """
+        ids = input_.reshape(-1).to(torch.int64)
+        uids, inverse = torch.unique(ids, return_inverse=True)
+        uids_cpu = uids.to("cpu", torch.int64)
+        packed_cpu = layer._exl3_ngram_disk.gather(uids_cpu)
+        heads_cpu = torch.searchsorted(
+            layer._exl3_ngram_head_offsets_cpu, uids_cpu, right=True
+        ) - 1
+        heads_cpu = heads_cpu.clamp_(0, self.num_heads - 1).to(torch.int32)
+        # Blocking uploads on purpose: a non_blocking copy out of a pinned temporary
+        # can outlive the temporary and read freed memory, and the device-to-host copy
+        # above already synchronized this stream, so nothing is gained by overlapping.
+        packed = packed_cpu.to(input_.device)
+        heads = heads_cpu.to(input_.device)
+        rows = self._decode(layer, packed, heads)
+        out = rows.index_select(0, inverse.to(rows.device))
         return out.to(layer._exl3_ngram_dtype).view(*input_.shape, NGRAM_ROW_DIM)
 
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None):
@@ -3243,6 +3403,15 @@ def _exl3_ngram_lookup_fake(ids: torch.Tensor, layer_name: str) -> torch.Tensor:
     return ids.new_empty(*ids.shape, NGRAM_ROW_DIM, dtype=layer._exl3_ngram_dtype)
 
 
+def _exl3_ngram_lookup_out_op(ids: torch.Tensor, layer_name: str, out: torch.Tensor) -> None:
+    layer = _EXL3_OPAQUE_LAYERS[layer_name]
+    out.copy_(layer.quant_method._embedding_impl(layer, ids))
+
+
+def _exl3_ngram_lookup_out_fake(ids: torch.Tensor, layer_name: str, out: torch.Tensor) -> None:
+    return None
+
+
 def _exl3_register_custom_ops() -> bool:
     global _EXL3_OPS_READY
     if _EXL3_OPS_READY:
@@ -3268,6 +3437,13 @@ def _exl3_register_custom_ops() -> bool:
                 op_func=_exl3_ngram_lookup_op,
                 mutates_args=[],
                 fake_impl=_exl3_ngram_lookup_fake,
+            )
+        if not hasattr(torch.ops.vllm, "exl3_ngram_lookup_out"):
+            direct_register_custom_op(
+                op_name="exl3_ngram_lookup_out",
+                op_func=_exl3_ngram_lookup_out_op,
+                mutates_args=["out"],
+                fake_impl=_exl3_ngram_lookup_out_fake,
             )
     except Exception as exc:  # pragma: no cover - registration is best effort
         logger.warning("EXL3 custom op registration failed; eager fallback: %r", exc)

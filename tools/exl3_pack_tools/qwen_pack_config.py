@@ -149,7 +149,7 @@ def main():
     # Row-wise n-gram tables: one spec, matched by module leaf name; all tables must agree.
     tables = scan.get("ngram_tables") or {}
     if tables:
-        geoms = {(t["bits"], t["num_shards"], t["rows_per_shard"]) for t in tables.values()}
+        geoms = {(t["bits"], t["num_shards"], t["rows_per_shard"], bool(t.get("sharded", True))) for t in tables.values()}
         if len(geoms) != 1:
             print("REFUSE: n-gram tables differ in geometry:", geoms)
             return 2
@@ -163,13 +163,15 @@ def main():
         if len(heads) != 1:
             print("REFUSE: n-gram tables differ in head count:", heads)
             return 2
-        bits, num_shards, rows = next(iter(geoms))
+        bits, num_shards, rows, sharded = next(iter(geoms))
         new_q["ngram_embedding"] = {
             "bits": int(bits),
             "num_shards": int(num_shards),
             "rows_per_shard": int(rows),
             "num_heads": heads.pop(),
             "modules": sorted({r.rsplit(".", 1)[-1] for r in tables}),
+            # False: one `<root>.trellis` tensor holds the whole table (num_shards is 1)
+            "sharded": bool(sharded),
         }
 
     print(f"experts: base K={base}, layer overrides={len(layer_bits)} {layer_bits if len(layer_bits) < 20 else '(many)'}")
