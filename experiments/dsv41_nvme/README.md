@@ -176,13 +176,11 @@ before clearing the `LinearEXL3` handles and returning the arena range to
   checks fail: release after the stream block exits records on the release-time
   stream; nested leases on two streams both land on one stream) and GREEN
   against the repaired bytes.
-- GPU fixture prepared and deliberately NOT RUN here:
-  `test_lease_stream_cuda.py` is opt-in via `DSV41_NVME_CUDA_CONTRACT=1` plus a
-  device. It uses real streams and real `torch.cuda.Event`, a 1 MiB arena and no
-  model, weights, exllamav3 or large cache, and discriminates on stream
-  occupancy rather than timing luck (the pre-repair release lands on the
-  deliberately busy release-time stream, the repaired one on the lease's own
-  stream). No CUDA receipt is claimed for this repair.
+- `test_lease_stream_cuda.py` is opt-in via `DSV41_NVME_CUDA_CONTRACT=1` plus a
+  device. It instruments real CUDA events, uses a 1 MiB arena with disjoint
+  consumer ranges, and checks acquisition-stream identity and actual completion
+  before region release. It uses no model, weights or projection load, and has
+  no timing-based pass criterion. Full expert-cache serving remains a separate gate.
 - Provenance: `expert_cache.py` is no longer byte-identical to its extraction.
   `source-provenance.json` now pins both the original extraction hash
   (`original_extraction_sha256`) and the repaired bytes, with a hash-pinned

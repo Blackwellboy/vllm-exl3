@@ -1,199 +1,99 @@
-"""Opt-in CUDA fixture for the ExpertCache lease stream contract. NOT RUN HERE.
-
-This is the tiny real-hardware counterpart of `test_lease_stream_contract.py`,
-prepared so the parent can run it on a GPU host without a model, weights,
-exllamav3 or a large cache: it allocates one 1 MiB arena and two scratch
-tensors, uses real CUDA streams and real `torch.cuda.Event` objects, and
-constructs no `LinearEXL3` (the leased `Entry` carries an empty projection dict,
-which is all `_evict()`'s `projections.clear()` needs).
-
-It is skipped unless BOTH are true:
-  * `torch.cuda.is_available()`, and
-  * `DSV41_NVME_CUDA_CONTRACT=1` (explicit opt-in; never runs by accident).
-
-Run it with:
-    DSV41_NVME_CUDA_CONTRACT=1 python -m pytest experiments/dsv41_nvme/test_lease_stream_cuda.py -v
-
-Discrimination for the L1 defect uses stream occupancy, not luck: the correct
-code records the release event on the stream that owns the lease, so the event
-completes as soon as that stream's work drains; the pre-fix code records on
-whatever stream is current at release (here: the default stream, deliberately
-kept busy), so the event sits behind unrelated queued work. Each check first
-confirms the discriminator is actually in place (the busy stream's own probe
-event must still be pending) and fails loudly instead of passing silently if the
-device drains too fast for the margin.
-
-No CUDA receipt is claimed by this repository for these checks: they are
-prepared, gated and unrun on the review host.
-"""
+"""Opt-in real-CUDA lease/event contract; no model or expert projection load."""
 import os
 import sys
 import threading
-import time
 import unittest
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
-
+from unittest.mock import patch
 import torch
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_lease_stream_contract import load_expert_cache  # noqa: E402  (import shim + loader)
+from test_lease_stream_contract import load_expert_cache
 
-# The environment gate is evaluated FIRST: without the explicit opt-in no CUDA
-# query of any kind is made, so a review host with a device present is untouched.
-OPT_IN = os.environ.get("DSV41_NVME_CUDA_CONTRACT") == "1"
-ENABLED = OPT_IN and torch.cuda.is_available()
-SKIP_REASON = (
-    "requires a CUDA device and DSV41_NVME_CUDA_CONTRACT=1 (opt-in); "
-    "prepared but NOT RUN on the review host - no CUDA receipt is claimed"
-)
-ARENA_BYTES = 1 << 20  # 1 MiB, deliberately tiny
-SPIN = 1.0000017
+ENABLED = os.environ.get('DSV41_NVME_CUDA_CONTRACT') == '1' and torch.cuda.is_available()
 
-
-def _spin(iterations, tensor):
-    """Enqueue a deterministic amount of elementwise work on the current stream."""
-    for _ in range(iterations):
-        tensor.mul_(SPIN)
-    return tensor
-
-
-def calibrate(device):
-    """A 1 MiB scratch tensor plus the _spin iteration count costing ~1 second."""
-    tensor = torch.ones(1 << 18, dtype=torch.float32, device=device)
-    timer_stream = torch.cuda.Stream()
-    start = time.monotonic()
-    with torch.cuda.stream(timer_stream):
-        _spin(64, tensor)
-    timer_stream.synchronize()
-    per_iteration = (time.monotonic() - start) / 64
-    iterations = max(256, min(2_000_000, int(1.0 / max(per_iteration, 5e-6))))
-    return iterations, tensor
-
-
-def build_cache(module, key="0:1", size=4096):
-    """A real arena, real Regions accounting, no model and no projection handles."""
-    cache = module.ExpertCache.__new__(module.ExpertCache)
-    cache.device = torch.device("cuda:0")
-    cache.lock = threading.RLock()
-    cache.closed = False
-    cache.store = SimpleNamespace(records={key: {"bytes": size}})
-    cache.entries = OrderedDict()
-    cache.stats = dict(hits=0, misses=0, evictions=0, failures=0, peak_resident_bytes=0)
-    cache.generation = 1
-    cache.regions = {int(key.split(":")[0]): module.Regions(ARENA_BYTES, 0)}
-    cache.resident_bytes = size
-    cache.arena = torch.empty(ARENA_BYTES, dtype=torch.uint8, device=cache.device)
-    offset = cache.regions[int(key.split(":")[0])].allocate(size)
-    assert offset is not None
-    cache.entries[key] = module.Entry(key, offset, size, 1, {})
-    return cache, cache.entries[key]
-
-
-def wait_pending(event, timeout=10.0):
-    """True if *event* completes within *timeout*, reported with its latency."""
-    start = time.monotonic()
-    while not event.query():
-        if time.monotonic() - start > timeout:
-            return False, time.monotonic() - start
-        time.sleep(0.002)
-    return True, time.monotonic() - start
-
-
-@unittest.skipUnless(ENABLED, SKIP_REASON)
+@unittest.skipUnless(ENABLED, 'requires explicit CUDA contract opt-in and real CUDA')
 class LeaseStreamCudaTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.module = load_expert_cache(Path(__file__).resolve().parent)
-        cls.iterations, cls.scratch = calibrate(torch.device("cuda:0"))
-
     def setUp(self):
+        self.module = load_expert_cache(Path(__file__).resolve().parent)
+        real_event = torch.cuda.Event
+        class ObservedEvent:
+            # Instrument real events; never emulate CUDA completion.
+            def __init__(self):
+                self.native = real_event()
+                self.stream = None
+                self.synchronized = False
+            def record(self, stream=None):
+                self.stream = stream if stream is not None else torch.cuda.current_stream()
+                self.native.record(self.stream)
+            def query(self):
+                return self.native.query()
+            def synchronize(self):
+                self.native.synchronize()
+                self.synchronized = True
+        self.observer = patch.object(torch.cuda, 'Event', ObservedEvent)
+        self.observer.start()
+        self.addCleanup(self.observer.stop)
+        cache = self.module.ExpertCache.__new__(self.module.ExpertCache)
+        cache.device = torch.device('cuda:0')
+        cache.lock = threading.RLock()
+        cache.closed = False
+        cache.store = SimpleNamespace(records={'0:1': {'bytes':4096}})
+        cache.entries = OrderedDict()
+        cache.stats = dict(hits=0, misses=0, evictions=0, failures=0, peak_resident_bytes=0)
+        cache.generation = 1
+        cache.regions = {0: self.module.Regions(1 << 20, 0)}
+        cache.resident_bytes = 4096
+        cache.arena = torch.zeros(1 << 20, dtype=torch.uint8, device=cache.device)
+        offset = cache.regions[0].allocate(4096)
+        cache.entries['0:1'] = self.module.Entry('0:1',offset,4096,1,{})
         torch.cuda.synchronize()
+        self.cache, self.entry = cache, cache.entries['0:1']
+        self.addCleanup(torch.cuda.synchronize)
 
-    def tearDown(self):
-        torch.cuda.synchronize()
-
-    def busy_default(self):
-        """Keep the default stream busy and confirm the discriminator is live."""
-        default = torch.cuda.current_stream(torch.device("cuda:0"))
-        probe = torch.cuda.Event()
-        with torch.cuda.stream(default):
-            _spin(self.iterations, self.scratch)
-            probe.record()
-        self.assertFalse(
-            probe.query(),
-            "calibration failed to keep the default stream busy; re-run with a larger "
-            "calibrate() target rather than trusting a silent pass",
-        )
-        return probe
-
-    def test_release_after_the_stream_context_exits_records_on_the_acquisition_stream(self):
-        cache, entry = build_cache(self.module)
+    def test_release_after_stream_context_uses_acquisition_stream(self):
         owning = torch.cuda.Stream()
-        self.busy_default()
-        lease = cache.lease("0:1")
+        lease = self.cache.lease('0:1')
         with torch.cuda.stream(owning):
             lease.__enter__()
-            _spin(32, self.scratch)  # the consumer's work, on the acquisition stream
-        lease.__exit__(None, None, None)  # release happens outside the stream block
-        self.assertEqual(entry.users, 0)
-        completed, latency = wait_pending(entry.events[-1])
-        self.assertTrue(completed, "release event never completed")
-        self.assertLess(
-            latency, 0.25,
-            "the release event waited behind work on the stream current at release "
-            "instead of the stream captured at acquisition",
-        )
+            self.cache.arena[:4096].fill_(7)
+        lease.__exit__(None,None,None)
+        event = self.entry.events[-1]
+        self.assertEqual(event.stream.cuda_stream, owning.cuda_stream)
+        event.synchronize()
+        self.assertTrue(event.query())
+        self.assertTrue(torch.equal(self.cache.arena[:4096].cpu(), torch.full((4096,),7,dtype=torch.uint8)))
+        self.assertEqual(self.entry.users,0)
 
-    def test_concurrent_leases_on_different_streams_keep_their_own_event_stream(self):
-        cache, entry = build_cache(self.module)
-        busy_stream, quiet_stream = torch.cuda.Stream(), torch.cuda.Stream()
-        default = torch.cuda.current_stream(torch.device("cuda:0"))
-        probe = torch.cuda.Event()
-        with torch.cuda.stream(default):
-            _spin(self.iterations, self.scratch)
-            probe.record()
-        self.assertFalse(probe.query(), "discriminator not in place; refusing a silent pass")
-        first, second = cache.lease("0:1"), cache.lease("0:1")
-        with torch.cuda.stream(busy_stream):
-            first.__enter__()
-        with torch.cuda.stream(quiet_stream):
-            second.__enter__()
-        self.assertEqual(entry.users, 2)
-        second.__exit__(None, None, None)   # quiet stream, released outside its block
-        first.__exit__(None, None, None)    # busy stream, released outside its block
-        self.assertEqual(entry.users, 0)
-        self.assertEqual(len(entry.events), 2)
-        quiet_done, _ = wait_pending(entry.events[0], timeout=5.0)
-        self.assertTrue(quiet_done, "the quiet lease's event must complete on its own stream")
-        self.assertFalse(
-            entry.events[1].query(),
-            "the busy lease's event must still be pending on ITS acquisition stream; "
-            "pending nowhere means both events landed on the idle default stream",
-        )
+    def test_concurrent_leases_keep_distinct_streams(self):
+        a,b = torch.cuda.Stream(),torch.cuda.Stream()
+        first,second = self.cache.lease('0:1'),self.cache.lease('0:1')
+        with torch.cuda.stream(a):
+            first.__enter__();self.cache.arena[:2048].fill_(3)
+        with torch.cuda.stream(b):
+            second.__enter__();self.cache.arena[2048:4096].fill_(5)
+        second.__exit__(None,None,None);first.__exit__(None,None,None)
+        events = list(self.entry.events)
+        self.assertEqual([e.stream.cuda_stream for e in events],[b.cuda_stream,a.cuda_stream])
+        for event in events:event.synchronize()
+        self.assertTrue(torch.equal(self.cache.arena[:4096].cpu(),torch.cat([torch.full((2048,),3,dtype=torch.uint8),torch.full((2048,),5,dtype=torch.uint8)])))
+        self.assertEqual(self.entry.users,0)
 
-    def test_eviction_waits_for_work_queued_on_the_captured_stream(self):
-        cache, entry = build_cache(self.module)
-        owning = torch.cuda.Stream()
-        lease = cache.lease("0:1")
+    def test_eviction_waits_for_real_events_before_region_release(self):
+        owning = torch.cuda.Stream();lease=self.cache.lease('0:1')
         with torch.cuda.stream(owning):
-            lease.__enter__()
-            _spin(self.iterations, self.scratch)  # queued before the release event
-        lease.__exit__(None, None, None)
-        start = time.monotonic()
-        cache._evict("0:1")
-        elapsed = time.monotonic() - start
-        self.assertGreaterEqual(
-            elapsed, 0.5,
-            "_evict() returned before the work queued on the lease's captured stream "
-            "drained; the gating event was not recorded on that stream",
-        )
-        self.assertNotIn("0:1", cache.entries)
-        self.assertEqual(cache.resident_bytes, 0)
-        self.assertEqual(cache.stats["evictions"], 1)
-        self.assertTrue(entry.events[0].query())
+            lease.__enter__();self.cache.arena[:4096].fill_(11)
+        lease.__exit__(None,None,None)
+        events=list(self.entry.events)
+        self.assertEqual(events[0].stream.cuda_stream,owning.cuda_stream)
+        region=self.cache.regions[0];release=region.release
+        def checked_release(offset):
+            self.assertTrue(all(e.synchronized and e.query() for e in events))
+            return release(offset)
+        with patch.object(region,'release',checked_release):self.cache._evict('0:1')
+        self.assertNotIn('0:1',self.cache.entries)
+        self.assertEqual(self.cache.resident_bytes,0)
+        self.assertTrue(torch.equal(self.cache.arena[:4096].cpu(),torch.full((4096,),11,dtype=torch.uint8)))
 
-
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == '__main__':unittest.main()
