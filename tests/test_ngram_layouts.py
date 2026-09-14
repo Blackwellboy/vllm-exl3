@@ -144,7 +144,8 @@ def test_unsharded_and_disk_lookups_match_the_resident_sharded_table(monkeypatch
 
 def test_disk_table_routes_rows_across_shards():
     t = _table(2)
-    d = X._NgramDiskTable([t[:20], t[20:40], t[40:]], rows_per_shard=20)
+    # every shard but the last holds rows_per_shard rows; the last may be short
+    d = X._NgramDiskTable([t[:20], t[20:40], t[40:60], t[60:]], rows_per_shard=20)
     uids = torch.tensor([0, 19, 20, 39, 40, 63], dtype=torch.long)
     assert torch.equal(d.gather(uids), t.index_select(0, uids))
     assert d.num_rows == ROWS
