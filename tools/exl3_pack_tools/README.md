@@ -62,6 +62,8 @@ duplicate JSON keys and inconsistent shapes, and streams with a 1 MiB copy
 buffer plus the header and per-tensor receipts. Unreferenced padding is
 discarded; unsupported dtypes fail rather than being guessed. The source
 must remain idle during the copy. Receipts contain SHA256 hashes of copied
-tensor bytes, not proof of a trusted model revision. Keep the original
-checkpoint and revision checks. If shard filenames change in the serving
-copy, regenerate its index before loading it.
+tensor bytes, not proof of a trusted model revision. The CLI report also
+carries `source_bytes`, `destination_bytes` and the signed `discarded_bytes`
+delta, so a run can attest that only unreferenced bytes were dropped. Keep
+the original checkpoint and revision checks. If shard filenames change in
+the serving copy, regenerate its index before loading it.

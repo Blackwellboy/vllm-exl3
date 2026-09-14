@@ -141,7 +141,15 @@ def main():
         receipts = compact_file(args.source, args.destination)
     except (OSError, ValueError) as error:
         parser.exit(2, f"{error}\n")
-    print(json.dumps({"tensors": receipts}, indent=2))
+    source_bytes = args.source.stat().st_size
+    destination_bytes = args.destination.stat().st_size
+    print(json.dumps({
+        "source_bytes": source_bytes,
+        "destination_bytes": destination_bytes,
+        # Signed delta so a caller can attest that only unreferenced bytes moved.
+        "discarded_bytes": source_bytes - destination_bytes,
+        "tensors": receipts,
+    }, indent=2))
 
 
 if __name__ == "__main__":
