@@ -195,6 +195,11 @@ def compact_file(source, destination):
             ):
                 raise ValueError("Source changed during copy")
             verify_before_publish(temporary, len(raw), fixed, receipts)
+            final = os.fstat(original.fileno())
+            if (initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns) != (
+                final.st_size, final.st_mtime_ns, final.st_ctime_ns
+            ):
+                raise ValueError("Source changed during verification")
             # Same-filesystem link is atomic and refuses a concurrent destination.
             os.link(temporary, destination)
         finally:
