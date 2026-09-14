@@ -15,6 +15,22 @@ def _sha16_cpu(t) -> str:
     return hashlib.sha256(u8.numpy().tobytes()).hexdigest()[:16]
 
 
+def _global_expert_id(mod: Any, local_i: int, global_map: Any = None) -> int | None:
+    """Resolve a local EP slot to its global expert id when placement is known."""
+    if global_map is not None:
+        try:
+            return int(global_map[local_i])
+        except Exception:
+            pass
+    starting_offset = getattr(mod, "starting_expert_offset", None)
+    if starting_offset is not None:
+        try:
+            return int(starting_offset) + int(local_i)
+        except Exception:
+            pass
+    return None
+
+
 class ParityWorkerExtension:
     """Methods are injected onto the vLLM worker via --worker-extension-cls."""
 
@@ -170,10 +186,11 @@ class ParityWorkerExtension:
                     length = len(plist)
                 except Exception:
                     continue
-                # Map local index -> try to get global expert id if available
-                global_map = getattr(mod, "expert_ids", None) or getattr(
-                    mod, "global_expert_ids", None
-                )
+                # Map local index -> global expert id using explicit placement
+                # first, then the EP starting offset used by current RoutedExperts.
+                global_map = getattr(mod, "expert_ids", None)
+                if global_map is None:
+                    global_map = getattr(mod, "global_expert_ids", None)
                 for local_i in range(length):
                     try:
                         t = plist[local_i]
@@ -181,16 +198,12 @@ class ParityWorkerExtension:
                         continue
                     if not torch.is_tensor(t):
                         t = getattr(t, "data", t)
-                    geid = None
-                    if global_map is not None:
-                        try:
-                            geid = int(global_map[local_i])
-                        except Exception:
-                            geid = None
+                    geid = _global_expert_id(mod, local_i, global_map)
                     if geid is not None and geid not in expert_ids and expert_ids:
                         continue
                     if geid is None and local_i not in expert_ids and expert_ids:
-                        # if no global map, sample by local index when it matches
+                        # Last-resort local-index sampling only when placement
+                        # metadata is genuinely unavailable.
                         continue
                     K = None
                     if "trellis" in list_name and torch.is_tensor(t) and t.ndim == 3:
