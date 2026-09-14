@@ -33,6 +33,7 @@ __all__ = [
 def register() -> None:
     # Importing the module executes its register_quantization_config decorator.
     from . import exl3
+    from .bf16_madv_compat import install_mixed_bf16_madv_compat
     from .deepseek_v41 import install_deepseek_v41_compat
     from .k78_compat import install_k78_config_compat
     from .mixed_k_guard import install_mixed_k_prescan_guard
@@ -66,6 +67,10 @@ def register() -> None:
     install_deepseek_v41_compat(exl3)
     install_native_row_policy(exl3)
     install_uva_expert_validation(exl3)
+
+    # Keep direct/public registration equivalent to the vLLM plugin entrypoint.
+    # The shim is idempotent, so plugin auto-discovery may safely call it again.
+    install_mixed_bf16_madv_compat(exl3)
 
 
 def runtime_diagnostics():
