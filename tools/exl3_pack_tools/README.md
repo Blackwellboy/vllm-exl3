@@ -44,3 +44,37 @@ before vLLM can load it.
 
 Typical order: scan, rewrite the config, regenerate the index, then run the
 gates in `tools/verify_native_pack/` before booting a server.
+
+## Repair a shard with gaps between tensors
+
+`compact_safetensors.py` copies an existing shard into a new, contiguous
+container when a safetensors reader rejects gaps in its payload layout.
+Names, shapes, dtypes, metadata and tensor bytes are preserved, including
+per-projection packed K and signed MUL1 markers. It does not requantize.
+
+```sh
+python3 tools/exl3_pack_tools/compact_safetensors.py source.safetensors repaired.safetensors > receipts.json
+python3 -m pytest -q tests/test_compact_safetensors.py tests/test_compact_safetensors_attestation.py
+```
+
+Publication is fail-closed. After the copy is flushed and fsynced - and before
+the finished file is linked into place - the tool (1) re-opens it with the real
+`safetensors` parser and requires the parsed names, dtypes, shapes and metadata
+to match the written header, and (2) streams the written file back and recomputes
+a SHA256 for every tensor directly from the destination bytes. If the parser
+cannot be imported, rejects the file, or either digest disagrees, the run aborts
+and no destination appears. Every tensor receipt therefore carries `sha256`
+(source bytes as copied) *and* `destination_sha256` (read back from the file that
+would be published); the CLI report adds a `parser` block naming the module,
+version and verified tensor count.
+
+The destination must not exist. The tool rejects overlaps, truncation,
+duplicate JSON keys and inconsistent shapes, and streams with a 1 MiB copy
+buffer plus the header and per-tensor receipts. Unreferenced padding is
+discarded; unsupported dtypes fail rather than being guessed. The source
+must remain idle during the copy. Receipts contain SHA256 hashes of copied
+tensor bytes, not proof of a trusted model revision. The CLI report also
+carries `source_bytes`, `destination_bytes` and the signed `discarded_bytes`
+delta, so a run can attest that only unreferenced bytes were dropped. Keep
+the original checkpoint and revision checks. If shard filenames change in
+the serving copy, regenerate its index before loading it.

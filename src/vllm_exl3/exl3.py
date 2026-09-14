@@ -1051,6 +1051,59 @@ def _exl3_moe_accepts_num_active(fn) -> bool:
     return "num_active" in doc or "arg29" in doc or doc.count("arg") >= 30
 
 
+# Positional arity of exllamav3's exl3_moe binding by release. The binding has no
+# parameter names, so the pybind docstring ("arg0: ..., arg34: ...") is the contract.
+EXL3_MOE_ARITY_147 = 30  # ..., act_limit, num_active            (exllamav3 <= 1.4.x)
+EXL3_MOE_ARITY_150 = 35  # + output_scratch, fused_base, count_lo, count_hi, m_tile (>= 1.5.0)
+
+
+def _exl3_moe_arity(fn) -> int | None:
+    """Number of positional arguments the bound exl3_moe takes, or None if unreadable."""
+    import re
+
+    doc = getattr(fn, "__doc__", None) or ""
+    idx = [int(m) for m in re.findall(r"\barg(\d+)\s*:", doc)]
+    if idx:
+        return max(idx) + 1
+    try:
+        import inspect
+
+        params = inspect.signature(fn).parameters.values()
+        if any(p.kind == p.VAR_POSITIONAL for p in params):
+            return None
+        return len(params)
+    except (TypeError, ValueError):
+        return None
+
+
+def _exl3_moe_temp_rows(temps) -> int:
+    """Row capacity of the fused temp buffers ([concurrency, rows, width]); the module
+    default when a caller hands in placeholders instead of tensors."""
+    first = temps[0] if temps else None
+    shape = getattr(first, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        return int(shape[-2])
+    return int(TEMP_ROWS_FUSED)
+
+
+def _exl3_moe_tail(fn, temp_rows: int) -> tuple:
+    """Trailing arguments exllamav3 1.5.0 added to exl3_moe, or () for older bindings.
+
+    1.5.0 appended output_scratch and fused_base (fp32 slot scratch plus slot table for
+    its deterministic-accumulation mode; None keeps the atomic scatter-add this plugin
+    relies on), count_lo and count_hi (the per-expert row-count band this launch owns,
+    1..temp rows covers every expert the fused kernel can take) and m_tile (kernel row
+    tile; 16 is the only instance the pre-1.5.0 kernel had). These values reproduce the
+    1.4.x all-fused launch, so the plugin's dispatch, fat-expert cap and temp buffers are
+    unchanged. Measured on one GB10 with Qwen3.8-Flash-Next 3.05 bpw: 52.05 tok/s at MTP
+    k=3 on 1.5.0 against 52.22 on 1.4.7, 28.54 against 27.77 without a draft.
+    """
+    arity = _exl3_moe_arity(fn)
+    if arity is not None and arity >= EXL3_MOE_ARITY_150:
+        return (None, None, 1, int(temp_rows), 16)
+    return ()
+
+
 def pin_exl3_expert_map(
     layer: torch.nn.Module, device: torch.device
 ) -> torch.Tensor | None:
@@ -1734,8 +1787,12 @@ def apply_exl3_fused_moe(
         *getattr(layer, "_exl3_codebook_flags", (True, False, True, False, True, False)),
         float(limit) if (limit is not None and limit > 0) else 0.0,
     )
+    # exllamav3 >= 1.5.0 takes five more positional arguments after num_active.
+    tail = _exl3_moe_tail(fn, _exl3_moe_temp_rows(temps))
+    if tail and n_active_host is None:
+        n_active_host = -1
     if n_active_host is not None:
-        fn(*args, n_active_host)
+        fn(*args, n_active_host, *tail)
     else:
         fn(*args)
 
@@ -2461,6 +2518,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
 
         owner_mod = owner if owner is not None else getattr(param, "_exl3_owner", None)
         tp_rank, tp_size = _resolve_tp_geometry(owner_mod, param)
+        if getattr(owner_mod, "use_ep", False):
+            # Expert parallel: experts are whole; feature slicing must not run
+            # (shard_exl3_col/row would quarter already-whole expert tensors).
+            tp_rank, tp_size = 0, 1
         suffix = _suffix_from_mapped_name(weight_name)
         # Avoid an early full-tensor .contiguous() copy. On GB10 UMA that
         # transient host copy sits beside the eventual device payload and was
