@@ -259,19 +259,32 @@ def test_resident_build_is_untouched_by_full_graphs(monkeypatch):
 def test_embedding_dispatch_through_the_registered_ops_matches_every_layout(monkeypatch):
     """Goes through ``embedding()``, i.e. the ops vLLM executes, not ``_embedding_impl``."""
     table = _table(7)
-    ids = torch.tensor([[0, 5, 31, 32, 63, 5]], dtype=torch.long)
+    # vLLM registers this op for its active platform, not every tensor backend.
+    device = "cuda" if torch.cuda.is_available() and torch._C._dispatch_has_kernel_for_dispatch_key(
+        "vllm::exl3_ngram_lookup", "CUDA"
+    ) else "cpu"
+    if device == "cpu" and not torch._C._dispatch_has_kernel_for_dispatch_key(
+        "vllm::exl3_ngram_lookup", "CPU"
+    ):
+        pytest.skip("registered n-gram operator requires an available CUDA device")
+    ids = torch.tensor([[0, 5, 31, 32, 63, 5]], dtype=torch.long, device=device)
+    def build(method, sharded):
+        # Create the real destination parameters on the operator's device;
+        # disk loaders still retain the explicitly supplied CPU source views.
+        with torch.device(device):
+            return _build(method, table, sharded=sharded)
 
     resident = _method({}, "resident", monkeypatch)
-    ref_layer = _build(resident, table, sharded=True)
+    ref_layer = build(resident, True)
     expected = resident.embedding(ref_layer, ids)
     assert torch.equal(expected, _lookup(resident, ref_layer, ids))
     assert torch.equal(torch.ops.vllm.exl3_ngram_lookup(ids, ref_layer._exl3_opaque_name), expected)
 
     uns = _method({"num_shards": 1, "rows_per_shard": ROWS, "sharded": False}, "resident", monkeypatch)
-    assert torch.equal(uns.embedding(_build(uns, table, sharded=False), ids), expected)
+    assert torch.equal(uns.embedding(build(uns, False), ids), expected)
 
     disk = _method({}, "disk", monkeypatch)
-    disk_layer = _build(disk, table, sharded=True)
+    disk_layer = build(disk, True)
     assert torch.equal(disk.embedding(disk_layer, ids), expected)
     out = torch.empty_like(expected)
     assert torch.ops.vllm.exl3_ngram_lookup_out(ids, disk_layer._exl3_opaque_name, out) is None
