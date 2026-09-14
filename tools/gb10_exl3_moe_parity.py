@@ -14,10 +14,9 @@ Scope, stated explicitly so the receipt can never be read as the other one:
     and the 30-argument call must be rejected (the original "incompatible function
     arguments" failure), so a green run also proves the padding is load-bearing.
 
-Within a launch K is uniform (K_gate == K_up == K_down, one kernel instance), so this
-probe runs the full launch once per K in --ks and compares each against the native
-exll3_gemv reference built with that same K. It never assumes one K for the stack: a
-mixed-bitrate model is per-layer K, and every layer's launch carries its own.
+Within this fused launch K is uniform. This probe covers that compatibility path
+at several K values; it does NOT qualify intra-layer SAGE mixed-K execution.
+That requires the separate mixed-store dispatcher/reference check.
 
 Inputs are the synthetic-but-real packs the existing native fixtures build
 (tests/test_native_p2b_moe.py, tools/bench_moe_decode.py): int16 EXL3 trellises with
@@ -83,7 +82,8 @@ def _reference(x, ids, weights, packs, k, device):
         u = vllm_exl3_c.exl3_gemv(x, pack["up"]["trellis"], pack["up"]["suh"], pack["up"]["svh"], k, True).float()
         h = (torch.nn.functional.silu(g) * u).half()
         d = vllm_exl3_c.exl3_gemv(h, pack["down"]["trellis"], pack["down"]["suh"], pack["down"]["svh"], k, True).float()
-        acc += weights[:, e : e + 1].float() * d
+        route_weight = ((ids == e).to(weights.dtype) * weights).sum(dim=1, keepdim=True)
+        acc += route_weight.float() * d
     return acc
 
 
