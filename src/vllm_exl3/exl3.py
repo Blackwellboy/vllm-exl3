@@ -1776,8 +1776,12 @@ def apply_exl3_fused_moe(
                 dtype=torch.int32,
                 device=dev,
             )
+            # Kernel contract: min_expert=-1 disables range filtering and
+            # indexes pointer tables by raw sel. Plugin sentinels are
+            # n_exp (non-local / EP). Pass [0, n_exp) so those routes
+            # contribute zero instead of OOB.
             exllamav3_ext.exl3_moe_coop(
-                xh, sel_c, rw_c, -1, -1, hidden,
+                xh, sel_c, rw_c, 0, int(n_exp), hidden,
                 ptrs["gate_trellis"], ptrs["gate_suh"], ptrs["gate_svh"],
                 ptrs["up_trellis"], ptrs["up_suh"], ptrs["up_svh"],
                 ptrs["down_trellis"], ptrs["down_suh"], ptrs["down_svh"],
