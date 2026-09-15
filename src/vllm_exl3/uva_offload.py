@@ -38,6 +38,8 @@ class UvaExpertLayerStatus:
     uva_parameters: tuple[str, ...]
     resident_parameters: tuple[str, ...]
     parameter_segments: tuple[str, ...]
+    placeholder_parameters: tuple[str, ...] = ()
+    arenas: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -75,6 +77,7 @@ def inspect_exl3_moe_uva_layer(
         )
 
     uva: list[str] = []
+    placeholders: list[str] = []
     cpu: list[str] = []
     resident: list[str] = []
     missing: list[str] = []
@@ -86,6 +89,13 @@ def inspect_exl3_moe_uva_layer(
             continue
         marked = bool(getattr(param, "_vllm_is_uva_offloaded", False))
         device_type = _device_type(param)
+        if marked and _numel(param) == 0:
+            # A 0-element placeholder carries vLLM's marker but holds no
+            # payload: the real trellis is allocated later by the arena
+            # planner. Count it separately so an empty marker cannot pass
+            # the placement gate on its own.
+            placeholders.append(name)
+            continue
         if marked:
             uva.append(name)
         elif device_type == "cpu":
@@ -99,8 +109,8 @@ def inspect_exl3_moe_uva_layer(
             f"payload: missing {missing}"
         )
 
-    fully = len(uva) == len(EXL3_MOE_UVA_PARAMETER_SEGMENTS)
-    partial = bool(uva) and not fully
+    fully = len(uva) + len(placeholders) == len(EXL3_MOE_UVA_PARAMETER_SEGMENTS)
+    partial = bool(uva or placeholders) and not fully
     return UvaExpertLayerStatus(
         applicable=True,
         required=bool(required),
@@ -110,7 +120,62 @@ def inspect_exl3_moe_uva_layer(
         uva_parameters=tuple(uva),
         resident_parameters=tuple(resident),
         parameter_segments=EXL3_MOE_UVA_PARAMETER_SEGMENTS,
+        placeholder_parameters=tuple(placeholders),
     )
+
+
+def _numel(param: Any) -> int | None:
+    fn = getattr(param, "numel", None)
+    if not callable(fn):
+        return None
+    try:
+        return int(fn())
+    except Exception:
+        return None
+
+
+EXL3_TRELLIS_ARENA_ATTRS: tuple[str, ...] = (
+    "_exl3_gate_trellis_arenas",
+    "_exl3_up_trellis_arenas",
+    "_exl3_down_trellis_arenas",
+)
+
+
+def validate_exl3_moe_uva_arenas(layer: Any) -> dict[str, object]:
+    """Require the packed trellis arenas themselves to be UVA views.
+
+    The construction-time guard can only see the 0-element trellis
+    placeholders. The payload is allocated by the arena planner during/after
+    weight loading, so the placement decision must be re-checked on the
+    arenas that the EXL3 handles will actually dereference.
+    """
+    if not hasattr(layer, "gate_trellis"):
+        return {"applicable": False}
+    summary: dict[str, object] = {"applicable": True, "uva_arenas": 0, "resident_arenas": 0, "bytes": 0}
+    resident: list[str] = []
+    for attr in EXL3_TRELLIS_ARENA_ATTRS:
+        arenas = getattr(layer, attr, None) or []
+        for i, arena in enumerate(arenas):
+            n = _numel(arena) or 0
+            summary["bytes"] = int(summary["bytes"]) + n * int(getattr(arena, "element_size", lambda: 2)())
+            if getattr(arena, "_vllm_is_uva_offloaded", False):
+                summary["uva_arenas"] = int(summary["uva_arenas"]) + 1
+            else:
+                summary["resident_arenas"] = int(summary["resident_arenas"]) + 1
+                resident.append(f"{attr}[{i}]")
+    if int(summary["uva_arenas"]) + int(summary["resident_arenas"]) == 0:
+        raise RuntimeError(
+            "EXL3 expert UVA was required but no trellis arenas exist after "
+            "weight loading; the legacy per-expert allocation path is not "
+            "qualified for UVA placement (VLLM_EXL3_TRELLIS_ARENA=0?)."
+        )
+    if resident:
+        raise RuntimeError(
+            "EXL3 expert UVA was required, but the packed trellis arenas were "
+            f"allocated on the accelerator instead of as mapped host views: "
+            f"{resident[:6]}{'...' if len(resident) > 6 else ''}"
+        )
+    return summary
 
 
 def validate_exl3_moe_uva_layer(layer: Any) -> UvaExpertLayerStatus:
@@ -158,10 +223,15 @@ def install_uva_expert_validation(exl3_module: Any) -> None:
         return
 
     def process_weights_after_loading_uva_guard(self, layer):
-        if uva_expert_offload_required() and hasattr(layer, "w13_trellis"):
+        required = uva_expert_offload_required() and hasattr(layer, "w13_trellis")
+        if required:
             status = validate_exl3_moe_uva_layer(layer)
             layer._exl3_uva_expert_status = status.to_dict()
-        return original(self, layer)
+        result = original(self, layer)
+        if required:
+            # The arenas are only final after the original post-load packing.
+            layer._exl3_uva_expert_status["arenas"] = validate_exl3_moe_uva_arenas(layer)
+        return result
 
     process_weights_after_loading_uva_guard._vllm_exl3_uva_guard_wrapped = True
     setattr(

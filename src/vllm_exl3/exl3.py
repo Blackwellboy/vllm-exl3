@@ -640,6 +640,51 @@ def _try_prescan_trellis_shapes(
     return shapes
 
 
+def _uva_trellis_placement_requested(layer: Any) -> bool:
+    """True when the packed routed-expert payload must live in pinned host memory.
+
+    Either the recipe demanded it (VLLM_EXL3_REQUIRE_UVA_EXPERTS=1) or vLLM's
+    UVA offloader already marked the layer's trellis placeholders at
+    construction time. In both cases the real payload allocated here must not
+    silently land on the accelerator.
+    """
+    from .uva_offload import uva_expert_offload_required
+
+    if uva_expert_offload_required():
+        return True
+    placeholder = getattr(layer, "w13_trellis", None)
+    return bool(getattr(placeholder, "_vllm_is_uva_offloaded", False))
+
+
+def _pinned_host_empty(shape: tuple[int, ...], dtype: "torch.dtype") -> "torch.Tensor":
+    return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+
+
+def _alloc_trellis_arena(
+    layer: Any, shape: tuple[int, ...], dest_device: "torch.device"
+) -> "torch.Tensor":
+    """Allocate one trellis arena on ``dest_device`` or, for UVA runs, as an
+    accelerator view of pinned host memory (vLLM's zero-copy placement)."""
+    if not _uva_trellis_placement_requested(layer):
+        return torch.empty(shape, dtype=torch.int16, device=dest_device)
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    host = _pinned_host_empty(tuple(int(x) for x in shape), torch.int16)
+    view = get_accelerator_view_from_cpu_tensor(host)
+    # Keep the pinned storage alive for as long as the layer exists.
+    keep = layer.__dict__.setdefault("_exl3_uva_host_arenas", [])
+    keep.append(host)
+    view._vllm_is_uva_offloaded = True
+    return view
+
+
+def _arena_parameter(arena: "torch.Tensor") -> "Parameter":
+    p = Parameter(arena, requires_grad=False)
+    if getattr(arena, "_vllm_is_uva_offloaded", False):
+        p._vllm_is_uva_offloaded = True
+    return p
+
+
 def prepare_trellis_arena_plan(
     layer: Any,
     shapes_by_proj: dict[str, dict[int, tuple[int, ...]]],
@@ -685,7 +730,7 @@ def prepare_trellis_arena_plan(
         n_experts = int(len(plist))
         for shape, eids in by_shape.items():
             n = len(eids)
-            arena = torch.empty((n, *shape), dtype=torch.int16, device=dest_device)
+            arena = _alloc_trellis_arena(layer, (n, *shape), dest_device)
             meta = {
                 "arena": arena,
                 "eid_to_idx": {eid: i for i, eid in enumerate(eids)},
@@ -700,7 +745,7 @@ def prepare_trellis_arena_plan(
                 new_p._exl3_owner = layer
                 plist[eid] = new_p
                 eid_index[proj][eid] = (shape, i)
-            arenas.append(Parameter(arena, requires_grad=False))
+            arenas.append(_arena_parameter(arena))
             stats["arenas"].setdefault(proj, []).append(
                 {"shape": list(shape), "n": n, "bytes": int(arena.nbytes)}
             )
@@ -832,9 +877,7 @@ def _pack_trellis_arenas(layer: Any) -> dict[str, Any]:
         n_experts = int(len(plist))
         for shape, items in by_shape.items():
             n = len(items)
-            arena = torch.empty(
-                (n, *shape), dtype=torch.int16, device=dest_device
-            )
+            arena = _alloc_trellis_arena(layer, (n, *shape), dest_device)
             for i, (eid, src) in enumerate(items):
                 if not (0 <= eid < n_experts):
                     raise RuntimeError(f"EXL3 arena expert id out of range: {eid}")
@@ -851,7 +894,7 @@ def _pack_trellis_arenas(layer: Any) -> dict[str, Any]:
                 plist[eid] = new_p
                 staging[proj].pop(eid, None)
                 del src
-            arenas.append(Parameter(arena, requires_grad=False))
+            arenas.append(_arena_parameter(arena))
             stats["arenas"].setdefault(proj, []).append(
                 {"shape": list(shape), "n": n, "bytes": int(arena.nbytes)}
             )
